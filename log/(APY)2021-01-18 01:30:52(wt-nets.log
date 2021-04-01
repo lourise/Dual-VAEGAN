@@ -1,0 +1,1581 @@
+import os
+import sys
+import time
+import argparse
+import torch
+from util import Logger
+import CLSWGAN, cycle_vaegan, cycle_vaegan2
+import VAEGAN
+torch.cuda.set_device(0)
+
+def str2bool(v):
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--dataset', default='APY')
+parser.add_argument('--generalized', type=str2bool, default=True)
+parser.add_argument('--pretrainedSC', type=str2bool, default=True)  # use the pretrained S,C or not
+args = parser.parse_args()
+
+
+os.makedirs('./log', exist_ok=True)
+sys.stdout = Logger('log/('+args.dataset+')'+time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())+'(wt-nets.log')
+
+
+with open('single_experiment_2.py') as f:
+    contents = f.read()
+    print(contents)
+f.close()
+with open('cycle_vaegan.py') as f:
+    contents = f.read()
+    print(contents)
+f.close()
+
+
+########################################
+# the basic hyperparameters
+########################################
+hyperparameters = {
+    'manualSeed': 9182,  # 9182  8894
+    'cls_weight': 0.01,
+    'wgan_weight': 10,
+    # 'perceptual_weight': 0.0,
+    'preprocessing': True,
+    'generalized': True,
+    'lr': 1e-4,
+    'image_embedding': 'res101',
+    'class_embedding': 'att_splits',
+    'lambda': 10,
+    'batch_size': 64,
+    'resSize': 2048,
+    'dataroot': './data',
+    'classifier_lr': 0.001,
+    'latent_feature_size': 64,
+    'activate_index': 0.2,
+    'pretrained_num': 15,
+    'warmup': {'beta': {'factor': 10.5, 'end_epoch': 93, 'start_epoch': 0},
+               'cross_reconstruction': {'factor': 10.37, 'end_epoch': 75, 'start_epoch': 21},
+               'distance': {'factor': 35.13, 'end_epoch': 22, 'start_epoch': 6},
+               'cycle': {'factor': 1, 'end_epoch': 80, 'start_epoch': 20},
+
+               },
+}
+if args.pretrainedSC:
+    hyperparameters['use_pretrain_s'] = True
+    hyperparameters['pretrain_classifier'] = './checkpoint/cl_' + args.dataset + '.pth'
+else:
+    hyperparameters['use_pretrain_s'] = False
+    hyperparameters['pretrain_classifier'] = ''
+
+# The training epochs for the final classifier, for early stopping, as determined on the validation spit
+hyps = [
+      {'dataset': 'AWA1', 'nets_epoch': 100, 'loss_syn_num': 30,  'netS_hid': 4096,  'ensemble_ratio': 1.5,  'cls_syn_num': 2400, 'cls_batch_size': 1650, 'nepoch': 30, 'netE_hid': 4096, 'netD_hid':1024,},
+      {'dataset': 'AWA2', 'nets_epoch': 100, 'loss_syn_num': 30,  'netS_hid': 4096,  'ensemble_ratio': 2,  'cls_syn_num': 5000, 'cls_batch_size': 2000, 'nepoch': 100, 'netE_hid': 4096, 'netD_hid':1024,},
+      {'dataset': 'CUB',  'nets_epoch': 100, 'loss_syn_num': 50,  'netS_hid': 8192,  'ensemble_ratio': 1.5,  'cls_syn_num': 450, 'cls_batch_size': 150, 'nepoch': 150, 'netE_hid': 4096, 'netD_hid':1024,},
+      {'dataset': 'SUN', 'nets_epoch': 100, 'loss_syn_num': 20, 'netS_hid': 8192, 'ensemble_ratio': 1.6,  'cls_syn_num': 1600, 'cls_batch_size': 400, 'nepoch':150, 'netE_hid': 4096, 'netD_hid':1024,},
+      {'dataset': 'APY', 'nets_epoch': 100, 'loss_syn_num': 10,  'netS_hid': 6142, 'ensemble_ratio': 1.5, 'cls_syn_num': 4000, 'cls_batch_size': 800, 'nepoch': 150, 'netE_hid': 4096, 'netD_hid':1024,},
+      {'dataset': 'FLO', 'nets_epoch': 100, 'loss_syn_num': 10, 'netS_hid': 4096, 'ensemble_ratio': 1.5, 'cls_syn_num': 450, 'cls_batch_size': 300, 'nepoch': 150, 'netE_hid': 4096, 'netD_hid':1024,},
+      ]
+
+##################################
+# change some hyperparameters here
+##################################
+hyperparameters['dataset'] = args.dataset
+hyperparameters['generalized'] = args.generalized
+# 设置分类器训练的train_steps
+for hyp in hyps:
+    if hyp['dataset'] == hyperparameters['dataset']:
+        for k, v in hyp.items():
+            hyperparameters[k] = v
+        break
+cycle_vaegan2.train(hyperparameters)
+print()
+
+
+import argparse
+import os
+import random
+import torch
+import torch.nn as nn
+import torch.autograd as autograd
+import torch.optim as optim
+import torch.backends.cudnn as cudnn
+from torch.autograd import Variable
+import math
+import util
+import classifier as classifier
+import classifier2 as classifier2
+import sys
+import model as model
+import numpy as np
+import semantic2lable as s2l
+import itertools
+from scipy import io as sio
+
+def map_label(label, classes):
+    mapped_label = torch.LongTensor(label.size())
+    for i in range(classes.size(0)):
+        mapped_label[label==classes[i]] = i
+
+    return mapped_label
+
+def pairwise_distances(x, y=None):
+    '''
+    Input: x is a Nxd matrix
+           y is an optional Mxd matirx
+    Output: dist is a NxM matrix where dist[i,j] is the square norm between x[i,:] and y[j,:]
+            if y is not given then use 'y=x'.
+    i.e. dist[i,j] = ||x[i,:]-y[j,:]||^2
+    '''
+    x_norm = (x ** 2).sum(1).view(-1, 1)  # x_norm:64*1  x:64*2048
+    if y is not None:
+        y_t = torch.transpose(y, 0, 1)
+        y_norm = (y ** 2).sum(1).view(1, -1)  # y_norm:1*450  y:450*2048
+    else:
+        y_t = torch.transpose(x, 0, 1)
+        y_norm = x_norm.view(1, -1)
+
+    dist = x_norm + y_norm - 2.0 * torch.mm(x, y_t)
+    # Ensure diagonal is zero if x=y
+    if y is None:  # dist reduce the diagonal matrix of dist
+        dist = dist - torch.diag(dist.diag)
+    return torch.clamp(dist, 0.0, np.inf)  # rescale the dist to [0, inf]
+
+def loadPretrainedMain(netS, savePost):
+    print('Loading pretrained Mainnet......')
+    path = './checkpoint/'
+    netS.load_state_dict(torch.load(path+savePost))
+    return netS
+
+def train(opt):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    data = util.DATA_LOADER(opt)  # get train data
+    opt['attSize'] = data.attribute.shape[1]
+    opt['nz'] = opt['latent_feature_size']
+    opt['device'] = device
+
+    input_res = torch.FloatTensor(opt['batch_size'], opt['resSize']).to(device)  # batch_size*2048 pretrained image features?
+    input_att = torch.FloatTensor(opt['batch_size'], opt['attSize']).to(device)  # batch_size*312
+    noise = torch.FloatTensor(opt['batch_size'], opt['nz']).to(device)  # batch_size*312  generate the noise vectors
+    unseen_noise = torch.FloatTensor(opt['batch_size'], opt['nz']).to(device)
+    one = torch.tensor(1, dtype=torch.float).to(device)  # tensor number: 1
+    mone = (one * -1).to(device)  # number: -1
+    input_label = torch.LongTensor(opt['batch_size']).to(device)  # label
+    input_label_ori = torch.LongTensor(opt['batch_size']).to(device)  # label
+
+    unseen_res = torch.FloatTensor(opt['batch_size'], opt['resSize']).to(device)  # batch_size*2048 pretrained image features?
+    unseen_att = torch.FloatTensor(opt['batch_size'], opt['attSize']).to(device)
+    unseen_label = torch.LongTensor(opt['batch_size']).to(device)  # label
+    unseen_label_ori = torch.LongTensor(opt['batch_size']).to(device)  # label
+    def sample():  # get a batch of seen class data and attributes
+        batch_feature, batch_label, batch_att = data.next_batch(opt['batch_size'])
+        input_res.copy_(batch_feature)
+        input_att.copy_(batch_att)
+        input_label_ori.copy_(batch_label)
+        input_label.copy_(util.map_label(batch_label, data.seenclasses))
+
+
+    def sample_unseen():  # get a batch of unseen classes data and attributes
+        batch_feature, batch_label, batch_att = data.next_batch_unseen(opt['batch_size'])
+        unseen_res.copy_(batch_feature)
+        unseen_att.copy_(batch_att)
+        unseen_label_ori.copy_(batch_label)
+        unseen_label.copy_(util.map_label(batch_label, data.unseenclasses))
+
+    if opt['manualSeed'] is None:
+        opt.manualSeed = random.randint(1, 10000)
+    print("Random Seed: ", opt['manualSeed'])
+    random.seed(opt['manualSeed'])
+    torch.manual_seed(opt['manualSeed'])  # random seed
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(opt['manualSeed'])
+    cudnn.benchmark = True
+
+
+    attE = model.Encoder_Att(opt).to(device)
+
+    attD = model.Decoder_Att(opt).to(device)
+
+    # initialize generator and discriminator
+    netG = model.MLP_G(opt).to(device)  # initialize G and decoder
+    print(netG)
+
+    netD = model.MLP_D(opt).to(device)  # initialize D
+    print(netD)
+
+    netD2 = model.MLP_D2(opt).to(device)
+    print(netD2)
+
+    netE = model.Encoder(opt).to(device)  # initialize Encoder
+    print(netE)
+
+    netAlign = model.Discriminator_align(opt).to(device)
+
+
+    logsoftmax = nn.LogSoftmax(dim=1)
+    # classification loss, Equation (4) of the paper
+    cls_criterion = nn.NLLLoss().to(device)
+
+
+    netS = model.MLP_V2S(opt).to(device)
+    # setup optimizer
+    optimizerD = optim.Adam(netD.parameters(), lr=opt['lr'], betas=(0.5, 0.999))
+    optimizerD2 = optim.Adam(netD2.parameters(), lr=opt['lr'], betas=(0.5, 0.999))
+    optimizerG = optim.Adam(netG.parameters(), lr=opt['lr'], betas=(0.5, 0.999))
+    optimizerE = optim.Adam(netE.parameters(), lr=opt['lr'], betas=(0.5, 0.999))
+    optimizerAE = optim.Adam(attE.parameters(), lr=opt['lr'], betas=(0.5, 0.999))
+    optimizerAD = optim.Adam(attD.parameters(), lr=opt['lr'], betas=(0.5, 0.999))
+    optimizerAlign = optim.Adam(netAlign.parameters(), lr=opt['lr'], betas=(0.5, 0.999))
+
+
+    if opt['dataset']=='FLO':
+        optimizerS = optim.Adam(netS.parameters(), lr=opt['lr']*1.5, betas=(0.5, 0.999))
+    else:
+        optimizerS = optim.Adam(netS.parameters(), lr=opt['lr'], betas=(0.5, 0.999))
+    reg_criterion = nn.MSELoss().to(device)
+    cro_criterion = nn.CrossEntropyLoss().to(device)
+    binary_cross_entropy_crition = nn.BCELoss().to(device)
+    nll_criterion = nn.NLLLoss().to(device)
+    KL_criterion = nn.KLDivLoss().to(device)
+
+    def getTestUnseenAcc():
+        fake_unseen_attr = netS(Variable(data.test_unseen_feature.cuda(), volatile=True))
+        dist = pairwise_distances(fake_unseen_attr.data, data.attribute[data.unseenclasses].cuda())  # range 50
+        pred_idx = torch.min(dist, 1)[1]  # relative pred
+        pred = data.unseenclasses[pred_idx.cpu()]  # map relative pred to absolute pred
+        acc = sum(pred == data.test_unseen_label) / data.test_unseen_label.size()[0]
+        print('Test Unseen Acc: {:.2f}%'.format(acc * 100))
+        return logsoftmax(Variable(dist.cuda())).data
+
+    def getTestAllAcc():
+        fake_unseen_attr = netS(Variable(data.test_unseen_feature.cuda(), volatile=True))  #
+        dist1 = pairwise_distances(fake_unseen_attr.data, data.attribute.cuda())  # 2967*200
+        pred_idx = torch.min(dist1, 1)[1]  # absolute pred  2967
+        acc_unseen = sum(pred_idx.cpu() == data.test_unseen_label).float() / data.test_unseen_label.size()[0]
+
+        fake_seen_attr = netS(Variable(data.test_seen_feature.cuda(), volatile=True))
+        dist2 = pairwise_distances(fake_seen_attr.data, data.attribute.cuda())  # range 200
+        pred_idx = torch.min(dist2, 1)[1]  # absolute pred
+        acc_seen = sum(pred_idx.cpu() == data.test_seen_label).float() / data.test_seen_label.size()[0]
+
+        if (acc_seen == 0) or (acc_unseen == 0):
+            H = 0
+        else:
+            H = 2 * acc_seen * acc_unseen / (acc_seen + acc_unseen)
+        print('Forward Seen:{:.2f}%, Unseen:{:.2f}%, H:{:.2f}%'.format(acc_seen * 100, acc_unseen * 100, H * 100))
+        return logsoftmax(Variable(dist1.cuda())).data, logsoftmax(Variable(dist2.cuda())).data
+
+    def caculateCosineSim(predAtt, allAtt):
+        sims = torch.zeros((predAtt.shape[0], allAtt.shape[0])).to(device)
+        for i, att in enumerate(predAtt):
+            for j in range(allAtt.shape[0]):
+                sims[i, j] = torch.nn.CosineSimilarity(dim=0)(att, allAtt[j])
+        return sims
+
+    modelStr = {'CUB': 'netS_CUB_Acc415900_03_15_11_23.pth', 'FLO': 'netS_FLO_Acc269300_03_15_10_26.pth',
+                'SUN': 'netS_SUN_Acc457600_03_15_10_44.pth',
+                'AWA1': 'netS_AWA1_Acc450100_03_15_10_58.pth', 'AWA2': 'netS_AWA2_Acc450100_03_15_10_58.pth',
+                'APY': 'netS_APY_Acc203100_03_15_11_08.pth'}
+    # if opt['use_pretrain_s'] == 1:
+    #     netS = loadPretrainedMain(netS, modelStr[opt['dataset']])
+    # else:
+    #     netS.train()
+    #     for epoch in range(opt['nets_epoch']):
+    #         for i in range(0, data.ntrain, opt['batch_size']):
+    #             optimizerS.zero_grad()
+    #             sample()
+    #             input_resv = Variable(input_res)
+    #             input_attv = Variable(input_att)
+    #             attv = Variable(data.most_sim_att[input_label_ori].to(device))
+    #             pred = netS(input_resv)
+    #             # sim_self = torch.nn.CosineSimilarity(dim=1)(pred, input_attv)
+    #             # sim_most = torch.nn.CosineSimilarity(dim=1)(pred, attv)
+    #             # ones = torch.ones_like(sim_most).to(device)
+    #             # tmp = (sim_most > sim_self).sum()
+    #             # loss_sim = (ones - sim_self).sum()
+    #             mse_loss = reg_criterion(pred, input_attv)
+    #             loss = mse_loss  # + loss_sim
+    #             loss.backward()
+    #             optimizerS.step()
+    #         # print("epoch:%d, loss:%.4f" % (epoch, loss.item()))
+    #         print(100 * '-')
+    #         print("epoch:%d, mse_loss:%.4f" % (epoch, mse_loss))
+    #         _ = getTestAllAcc()
+    #     for p in netS.parameters():
+    #         p.requires_grad = False
+    #     netS.eval()
+    #     os.makedirs('./checkpoint', exist_ok=True)
+    #     torch.save(netS.state_dict(), './checkpoint/' + modelStr[opt['dataset']])
+    # pretrain_cls = classifier.CLASSIFIER(data, opt, 0.001, 0.5, 100, 100)  # load pretrained model
+    # for p in pretrain_cls.model.parameters():  # set requires_grad to False
+    #     p.requires_grad = False
+    # pretrain_cls.model.eval()
+    # netS = loadPretrainedMain(netS, modelStr[opt['dataset']])
+    if opt['generalized']:
+        opt['gzsl_unseen_output'], opt['gzsl_seen_output'] = getTestAllAcc()
+        with torch.no_grad():
+            opt['fake_test_seen_attr'] = netS(
+                data.test_seen_feature.cuda()).data  # generate the corresponding fake_attr
+            opt['fake_test_unseen_attr'] = netS(data.test_unseen_feature.cuda()).data
+    else:
+        opt['gzsl_unseen_output'] = getTestUnseenAcc()
+        with torch.no_grad():
+            opt['fake_test_attr'] = netS(data.test_unseen_feature.cuda()).data
+
+    def generate_syn_feature(netG, classes, attribute, num):  # only generate the unseen feature
+        nclass = classes.size(0)
+        syn_feature = torch.FloatTensor(nclass * num, opt['resSize'])
+        syn_label = torch.LongTensor(nclass * num)
+        syn_att = torch.FloatTensor(num, opt['attSize']).to(device)
+        syn_noise = torch.FloatTensor(num, opt['nz']).to(device)
+        with torch.no_grad():
+            for i in range(nclass):
+                iclass = classes[i]
+                iclass_att = attribute[iclass]
+                syn_att.copy_(iclass_att.repeat(num, 1))
+                syn_noise.normal_(0, 1)  # directly sample noise from normal distribution and input the noise set Z into the G to get the newly generated features
+                output = netG(syn_noise, syn_att)
+                syn_feature.narrow(0, i * num, num).copy_(
+                    output.data.cpu())  # narrow method is to get some dimension data
+                syn_label.narrow(0, i * num, num).fill_(iclass)
+
+        return syn_feature, syn_label
+
+    def generate_seen_latent_feature(netG, netE, classes, attribute, num):  # only generate the unseen latent feature
+        nclass = classes.size(0)
+        syn_feature = torch.FloatTensor(nclass * num, opt['nz'])
+        syn_label = torch.LongTensor(nclass * num)
+        syn_att = torch.FloatTensor(num, opt['attSize']).to(device)
+        syn_noise = torch.FloatTensor(num, opt['nz']).to(device)
+        with torch.no_grad():
+            for i in range(nclass):
+                iclass = classes[i]
+                iclass_att = attribute[iclass]
+                syn_att.copy_(iclass_att.repeat(num, 1))
+                syn_noise.normal_(0, 1)  # directly sample noise from normal distribution and input the noise set Z into the G to get the newly generated features
+                output = netG(syn_noise, syn_att)
+                output_mu, output_logvar = netE(output)
+                output = reparameterize(output_mu, output_logvar)
+                syn_feature.narrow(0, i * num, num).copy_(
+                    output.data.cpu())  # narrow method is to get some dimension data
+                syn_label.narrow(0, i * num, num).fill_(iclass)
+
+        return syn_feature, syn_label
+
+    def generate_unseen_latent_feature(netE, classes, attribute, num):  # only generate the unseen latent feature
+        nclass = classes.size(0)
+        syn_feature = torch.FloatTensor(nclass * num, opt['nz'])
+        syn_label = torch.LongTensor(nclass * num)
+        syn_att = torch.FloatTensor(num, opt['attSize']).to(device)
+        syn_noise = torch.FloatTensor(num, opt['nz']).to(device)
+        with torch.no_grad():
+            for i in range(nclass):
+                iclass = classes[i]
+                iclass_att = attribute[iclass]
+                syn_att.copy_(iclass_att.repeat(num, 1))
+                # syn_noise.normal_(0, 1)  # directly sample noise from normal distribution and input the noise set Z into the G to get the newly generated features
+                # output = netG(syn_noise, syn_att)
+                output_mu, output_logvar = netE(syn_att)
+                output = reparameterize(output_mu, output_logvar)
+                syn_feature.narrow(0, i * num, num).copy_(output.data.cpu())  # narrow method is to get some dimension data
+                syn_label.narrow(0, i * num, num).fill_(iclass)
+
+        return syn_feature, syn_label
+
+    def generate_syn_feature_with_grad(netG, classes, attribute, num):
+        nclass = classes.size(0)  # 150
+        # syn_feature = torch.FloatTensor(nclass*num, opt['resSize'])
+        syn_label = torch.LongTensor(nclass * num).to(device)
+        syn_att = torch.FloatTensor(nclass * num, opt['attSize']).to(device)
+        syn_noise = torch.FloatTensor(nclass * num, opt['nz']).to(device)
+
+        syn_noise.normal_(0, 1)
+        for i in range(nclass):
+            iclass = classes[i]  # seen_classes
+            iclass_att = attribute[iclass]
+            syn_att.narrow(0, i * num, num).copy_(iclass_att.repeat(num, 1))  # 3000*312  0:row
+            syn_label.narrow(0, i * num, num).fill_(iclass)
+        syn_feature = netG(Variable(syn_noise), Variable(syn_att))
+        return syn_feature, syn_label.cpu()
+
+    def calc_gradient_penalty(netD, real_data, fake_data, input_att):
+        # print real_data.size()
+        alpha  = torch.rand(opt['batch_size'], 1)
+        alpha = alpha.expand(real_data.size()).to(device)
+
+        interpolates = alpha * real_data + ((1 - alpha) * fake_data)  # get new input base on the real and fake features
+        interpolates = interpolates.to(device)
+        interpolates = Variable(interpolates, requires_grad=True)
+        disc_interpolates = netD(interpolates, input_att)  #
+
+        ones = torch.ones(disc_interpolates.size()).to(device)
+        gradients = autograd.grad(outputs=disc_interpolates, inputs=interpolates,  # WGAN penalty
+                                  grad_outputs=ones,
+                                  create_graph=True, retain_graph=True, only_inputs=True)[0]
+
+        gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean() * 10
+        return gradient_penalty
+
+
+    def calc_gradient_penalty_without_att(netD2, real_data, fake_data, att):
+        # print real_data.size()
+        alpha  = torch.rand(opt['batch_size'], 1)
+        alpha = alpha.expand(real_data.size()).to(device)
+
+        interpolates = alpha * real_data + ((1 - alpha) * fake_data)  # get new input base on the real and fake features
+        interpolates = interpolates.to(device)
+        interpolates = Variable(interpolates, requires_grad=True)
+        disc_interpolates = netD2(interpolates, att)  #
+
+        ones = torch.ones(disc_interpolates.size()).to(device)
+        gradients = autograd.grad(outputs=disc_interpolates, inputs=interpolates,  # WGAN penalty
+                                  grad_outputs=ones,
+                                  create_graph=True, retain_graph=True, only_inputs=True)[0]
+
+        gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean() * 10
+        return gradient_penalty
+
+    def reparameterize(mu, logvar):
+        sigma = torch.exp(logvar/2)
+        eps = torch.cuda.FloatTensor(logvar.size()[0],1).normal_(0,1)
+        eps  = eps.expand(sigma.size())
+        return mu + sigma*eps
+
+    def KL_distance(mu, logvar):
+        return -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+
+    def Align_distance(f_mu, f_logvar, att_mu, att_logvar):  # align the distribution in the third space
+        s = torch.sqrt(torch.sum((f_mu - att_mu) ** 2, dim=1) + \
+                   torch.sum((torch.sqrt(f_logvar.exp()) - torch.sqrt(att_logvar.exp())) ** 2, dim=1))
+        return s.sum()
+
+    # train a classifier on seen classes, obtain \theta of Equation (4)
+    mse = nn.MSELoss().to(device)
+    # freeze the classifier during the optimization
+    best_H_cls = 0.0
+    ones = torch.ones_like(input_label).type(torch.float).to(device)
+    zeros = torch.zeros_like(input_label).type(torch.float).to(device)
+    # pretrain_cls.model.eval()
+    hyper_beta = {0.8, 1.2, 1.5, 2.0}
+    hyper_distance = {5.13, 8.13, 12.13, 15.13}
+    hyper_cycle = {1000, 3000, 5000, 7000}
+    best_H = []
+    tmp_H = []
+
+    for (beta, distance, cycle) in itertools.product(hyper_beta,hyper_distance,hyper_cycle):
+        if not os.path.exists('./checkpoint/' + 'pretrained_cadavae_' + opt['dataset'] + '-' + str(opt['pretrained_num']) + '.pth'):
+
+            for ae_epoch in range(opt['pretrained_num']):
+                    # warm up parameter()
+                f1 = 1.0 * (ae_epoch- opt['warmup']['cross_reconstruction']['start_epoch']) / \
+                     (1.0 * (opt['warmup']['cross_reconstruction']['end_epoch'] - opt['warmup']['cross_reconstruction']['start_epoch']))
+                f1 = f1 * (1.0 * opt['warmup']['cross_reconstruction']['factor'])
+                cross_reconstruction_factor = torch.cuda.FloatTensor([min(max(f1, 0), opt['warmup']['cross_reconstruction']['factor'])])
+                # (epoch-0)/(93-0)*0.25
+                f2 = 1.0 * (ae_epoch - opt['warmup']['beta']['start_epoch']) /\
+                     (1.0 * (opt['warmup']['beta']['end_epoch'] - opt['warmup']['beta']['start_epoch']))
+                f2 = f2 * (1.0 * opt['warmup']['beta']['factor'])
+                beta = torch.cuda.FloatTensor([min(max(f2, 0), opt['warmup']['beta']['factor'])])
+                # (epoch-6)/(22-6)*8.13
+                f3 = 1.0 * (ae_epoch - opt['warmup']['distance']['start_epoch']) /\
+                     (1.0 * (opt['warmup']['distance']['end_epoch'] - opt['warmup']['distance']['start_epoch']))
+                f3 = f3 * (1.0 * opt['warmup']['distance']['factor'])
+                distance_factor = torch.cuda.FloatTensor([min(max(f3, 0), opt['warmup']['distance']['factor'])])
+
+                f4 = 1.0 * (ae_epoch - opt['warmup']['cycle']['start_epoch']) / \
+                     (1.0 * (opt['warmup']['cycle']['end_epoch'] - opt['warmup']['cycle']['start_epoch']))
+                f4 = f4 * (1.0 * opt['warmup']['cycle']['factor'])
+                cycle_factor = torch.cuda.FloatTensor([min(max(f4, 0), opt['warmup']['cycle']['factor'])])
+
+                for i in range(0, data.ntrain, opt['batch_size']):
+
+                    optimizerAD.zero_grad()
+                    optimizerAE.zero_grad()
+                    optimizerE.zero_grad()
+                    optimizerG.zero_grad()
+
+                    sample()
+                    att_mu, att_logvar = attE(input_att)
+                    latent_att = reparameterize(att_mu, att_logvar)
+                    recon_att = attD(latent_att)
+                    att_reconstruct_to_feature = netG(latent_att, input_att)
+                    att_self_recon_loss = binary_cross_entropy_crition(recon_att, input_att)
+                    att_cross_recon_loss = binary_cross_entropy_crition(att_reconstruct_to_feature, input_res)
+                    att_KL_loss = KL_distance(att_mu, att_logvar)
+                    loss_att = att_self_recon_loss + beta * att_KL_loss + cross_reconstruction_factor * att_cross_recon_loss
+
+                    real_mu, real_logvar = netE(input_res)
+                    latent_feature = reparameterize(real_mu, real_logvar)
+                    reconstruct_feature = netG(latent_feature, input_att)
+                    # KLD = KL_distance(real_mu, real_logvar)
+                    # distribution = torch.FloatTensor(opt['batch_size'], opt['nz']).requires_grad(False)
+                    # distribution = distribution.copy_(noise).requires_grad(False)
+                    feature_KL_dis = KL_distance(real_mu, real_logvar)
+                    reconstruct_loss = binary_cross_entropy_crition(reconstruct_feature, input_res)
+                    feature_reconstruct_to_att = attD(latent_feature)
+                    feature_cross_recon_loss = binary_cross_entropy_crition(feature_reconstruct_to_att, input_att)
+                    loss_feature = reconstruct_loss + beta * feature_KL_dis + cross_reconstruction_factor * feature_cross_recon_loss
+
+                    align_loss = Align_distance(real_mu, real_logvar, att_mu, att_logvar)
+
+                    re_reconstruct_att_mu, re_reconstruct_att_logvar = attE(recon_att)
+                    re_reconstruct_latent_att = reparameterize(re_reconstruct_att_mu, re_reconstruct_att_logvar)
+                    re_reconstruct_att = attD(re_reconstruct_latent_att)
+                    cycle_att_loss = binary_cross_entropy_crition(re_reconstruct_att, input_att)  # + reg_criterion(re_reconstruct_att, recon_att.data)
+
+                    re_reconstruct_latent_feature_mu, re_reconstruct_latent_feature_logvar = netE(reconstruct_feature)
+                    re_reconstruct_latent_feature = reparameterize(re_reconstruct_latent_feature_mu,
+                                                                   re_reconstruct_latent_feature_logvar)
+                    re_reconstruct_feature = netG(re_reconstruct_latent_feature, input_att)
+                    cycle_loss = binary_cross_entropy_crition(re_reconstruct_feature, input_res)  # + reg_criterion(re_reconstruct_feature, reconstruct_feature.data)
+
+                    VAE_loss = loss_feature + loss_att + distance_factor * align_loss + cycle_factor * (cycle_att_loss + cycle_loss)
+
+                    VAE_loss.backward()
+
+                    optimizerG.step()
+                    optimizerE.step()
+                    optimizerAE.step()
+                    optimizerAD.step()
+
+            torch.save({
+                'G_state_dict': netG.state_dict(),
+                'E_state_dict': netE.state_dict(),
+                'AE_state_dict': attE.state_dict(),
+                'AD_state_dict': attD.state_dict(),
+                # 'netS_state_dict': netS.state_dict(),
+            }, './checkpoint/' + 'pretrained_cadavae_' + opt['dataset'] + '-' + str(opt['pretrained_num']) + '.pth')
+
+        else:
+            pretrained_path = torch.load('./checkpoint/' + 'pretrained_cadavae_' + opt['dataset'] + '-' + str(opt['pretrained_num']) + '.pth')
+            netG.load_state_dict(pretrained_path['G_state_dict'])
+            netE.load_state_dict(pretrained_path['E_state_dict'])
+            attD.load_state_dict(pretrained_path['AD_state_dict'])
+            attE.load_state_dict(pretrained_path['AE_state_dict'])
+        # for epoch in range(80):  # pretrain VAE
+        #
+        #     for i in range(0, data.ntrain, opt['batch_size']):
+        #         sample()
+        #         optimizerE.zero_grad()
+        #         optimizerG.zero_grad()
+        #         latent_mu, latent_logvar = netE(input_res)
+        #         latent = reparameterize(latent_mu, latent_logvar)
+        #         re = netG(latent, input_att)
+        #         kl_loss = KL_distance(latent_mu, latent_logvar)
+        #         re_loss = reg_criterion(input_res, re)
+        #         loss = kl_loss+ re_loss
+        #         loss.backward()
+        #         optimizerG.step()
+        #         optimizerE.step()
+
+
+
+        for epoch in range(opt['nepoch']):  # after 5 times update of discriminator will update generator once
+
+            for i in range(0, data.ntrain, opt['batch_size']):
+                # update the parameters of discriminator.
+                for p in netD.parameters():
+                    p.requires_grad = True
+                for p in netD2.parameters():
+                    p.requires_grad = True
+
+                for iter_d in range(5):  # 5
+                    sample()  # get samples
+                    optimizerD.zero_grad()
+                    optimizerD2.zero_grad()
+
+                    criticD_real = netD(input_res, input_att)  # real samples for D
+                    # criticD_real = binary_cross_entropy_crition(criticD_real, ones)
+                    criticD_real = criticD_real.mean()
+
+                    noise.normal_(0, 1)  # get seen class noise
+                    fake = netG(noise, input_att)  # generate seen classes fake features for D
+                    criticD_fake = netD(fake.detach(), input_att)  # discriminate the fake feature and get loss
+                    # criticD_fake = binary_cross_entropy_crition(criticD_fake, zeros)
+                    criticD_fake = criticD_fake.mean()
+                    # feature_reconstruct_mu, feature_reconstruct_logvar = netE(input_res)
+                    # reconstruct_latent_feature = reparameterize(feature_reconstruct_mu, feature_reconstruct_logvar)
+                    # criticD_real_reconstruct = netG(reconstruct_latent_feature, input_att)
+                    # criticD_real_reconstruct  = netD(criticD_real_reconstruct, input_att)
+                    # criticD_real_reconstruct = criticD_real_reconstruct.mean()
+
+
+
+                    criticD2_real = netD2(input_att, input_att)
+                    criticD2_real = criticD2_real.mean()
+                    criticD2_real_mu, critiD2_real_logvar = attE(input_att)
+                    criticD2_real_latent_feature = reparameterize(criticD2_real_mu, critiD2_real_logvar)
+                    real_construct = attD(criticD2_real_latent_feature)
+                    criticD2_real_reconstruct = netD2(real_construct, input_att)
+                    criticD2_real_reconstruct = criticD2_real_reconstruct.mean()
+                    fake_att = attD(noise)
+                    criticD2_fake = netD2(fake_att.detach(), input_att)
+                    criticD2_fake = criticD2_fake.mean()
+
+                    gradient_penalty = calc_gradient_penalty(netD, input_res, fake.data, input_att)  # weight penalty?
+
+                    gradient_penalty_D2 = calc_gradient_penalty_without_att(netD2, input_att, fake_att.data, input_att)
+
+                    D_cost = criticD_fake - criticD_real + gradient_penalty  # total loss
+
+                    D2_cost = criticD2_fake + gradient_penalty_D2 - criticD2_real  # + criticD2_real_reconstruct
+
+                    D_loss = D_cost + D2_cost
+
+                    D_loss.backward()
+                    optimizerD.step()
+                    optimizerD2.step()
+
+                # update the parameters of generator.
+                for p in netD.parameters():  # reset requires_grad
+                    p.requires_grad = False  # avoid computation
+
+                for p in netD2.parameters():  # reset requires_grad
+                    p.requires_grad = False  # avoid computation
+
+                optimizerG.zero_grad()
+                optimizerE.zero_grad()
+                optimizerAE.zero_grad()
+                optimizerAD.zero_grad()
+                optimizerAlign.zero_grad()
+
+
+                sample()
+                noise.normal_(0, 1)
+
+                att_mu, att_logvar = attE(input_att)
+                latent_att = reparameterize(att_mu, att_logvar)
+                recon_att = attD(latent_att)
+                self_recon_loss = binary_cross_entropy_crition(recon_att, input_att)
+                att_reconstruct_to_feature = netG(latent_att, input_att)
+                att_cross_recon_loss = binary_cross_entropy_crition(att_reconstruct_to_feature, input_res)
+                att_KL_loss = - KL_distance(att_mu, att_logvar)
+                loss_att = self_recon_loss + beta * att_KL_loss  + att_cross_recon_loss * opt['warmup']['cross_reconstruction']['factor']
+
+                # loss_att = self_recon_loss + opt['warmup']['beta']['factor'] * att_KL_loss  + att_cross_recon_loss * opt['warmup']['cross_reconstruction']['factor']
+
+                re_reconstruct_att_mu, re_reconstruct_att_logvar = attE(recon_att)
+                re_reconstruct_latent_att = reparameterize(re_reconstruct_att_mu, re_reconstruct_att_logvar)
+                re_reconstruct_att = attD(re_reconstruct_latent_att)
+                cycle_att_loss = binary_cross_entropy_crition(re_reconstruct_att, input_att)  # + binary_cross_entropy_crition(re_reconstruct_att, recon_att.data)
+                # cycle_latent_att_loss = reg_criterion(latent_att, re_reconstruct_latent_att)
+
+
+                real_mu, real_logvar = netE(input_res)
+                latent_feature = reparameterize(real_mu, real_logvar)
+                reconstruct_feature = netG(latent_feature, input_att)
+                feature_KL_dis = KL_distance(real_mu, real_logvar)
+                reconstruct_loss = binary_cross_entropy_crition(reconstruct_feature, input_res)
+                feature_reconstruct_to_att = attD(latent_feature)
+                feature_cross_recon_loss = binary_cross_entropy_crition(feature_reconstruct_to_att, input_att)
+                loss_feature = reconstruct_loss + beta * feature_KL_dis + feature_cross_recon_loss * opt['warmup']['cross_reconstruction']['factor']
+                # loss_feature = reconstruct_loss + opt['warmup']['beta']['factor'] * feature_KL_dis + feature_cross_recon_loss * opt['warmup']['cross_reconstruction']['factor']
+
+                re_reconstruct_latent_feature_mu, re_reconstruct_latent_feature_logvar = netE(reconstruct_feature)
+                re_reconstruct_latent_feature = reparameterize(re_reconstruct_latent_feature_mu, re_reconstruct_latent_feature_logvar)
+                re_reconstruct_feature = netG(re_reconstruct_latent_feature, input_att)
+                cycle_loss = binary_cross_entropy_crition(re_reconstruct_feature, input_res)  # + binary_cross_entropy_crition(re_reconstruct_feature, reconstruct_feature.data)
+                # cycle_latent_feature_loss = reg_criterion(re_reconstruct_latent_feature, latent_feature)
+
+                align_loss = Align_distance(real_mu, real_logvar, att_mu, att_logvar)
+                vae_loss = loss_feature + loss_att + align_loss * distance + cycle_loss * cycle + cycle_att_loss * cycle  # + cycle_latent_att_loss * 2 + cycle_latent_feature_loss * 2
+                # vae_loss = loss_feature + loss_att + align_loss * opt['warmup']['distance']['factor'] + cycle_loss * 5000 + cycle_att_loss * 5000  # + cycle_latent_att_loss * 2 + cycle_latent_feature_loss * 2
+
+                # vae_loss.backward(retain_graph=True)
+                # noise.normal_(0, 1)
+                fake = netG(noise, input_att)
+                # criticD_real = netD(input_res, input_att)  # of no use
+                criticG_fake = netD(fake, input_att)
+                criticG_fake = criticG_fake.mean()
+                # criticG_fake2 = netD(reconstruct_feature, input_att)
+                # criticG_fake2 = criticG_fake2.mean()
+                G_cost = - criticG_fake * opt['wgan_weight']  # - change minimize target to maximize the target- criticG_fake2
+
+                fake_att = attD(noise)
+                criticDe_fake = netD2(fake_att, input_att)
+                criticDe_fake = criticDe_fake.mean()
+                # criticDe_fake2 = netD2(recon_att, input_att)
+                # criticDe_fake2 = criticDe_fake2.mean()
+                D2_cost = - criticDe_fake * opt['wgan_weight']  # - criticDe_fake2 * 1
+
+                #
+                # origin_feature_latent_feature = netAlign(input_res, latent_feature)
+                # fake_latent_feature_rebuild_feature = netAlign(fake, noise)
+                # BiGAN_loss = binary_cross_entropy_crition(origin_feature_latent_feature, ones) - binary_cross_entropy_crition(fake_latent_feature_rebuild_feature, zeros)
+                # classification loss
+                # c_errG = cls_criterion(pretrain_cls.model(fake), input_label)
+
+                loss = G_cost + vae_loss + D2_cost  # + 0.7 * BiGAN_loss  # + loss_feature + loss_att + 8.13 * align_loss
+
+                loss.backward()
+                optimizerAE.step()
+                optimizerAD.step()
+                optimizerG.step()
+                optimizerE.step()
+                optimizerAlign.step()
+
+            print('EP[%d/%d]*******************************************************************' % (epoch, opt['nepoch']))
+            print('G_cost: %.4f, D2_loss: %.4f, vae_loss: %.4f, loss: %.4f' % (G_cost.item(), D2_cost, vae_loss.item(), loss.item()))
+            # print('tmp_seen:%d, tmp_unseen:%d' % (tmp_seen, tmp_unseen))5867
+
+            # evaluate the model, set G to evaluation mode
+            if epoch >= 0:
+                netG.eval()
+                netE.eval()
+                attE.eval()
+                attD.eval()
+                # Generalized zero-shot learning
+                syn_unseen_feature, syn_unseen_label = generate_syn_feature(netG, data.unseenclasses, data.attribute, opt['cls_syn_num'])  # 1500x2048 generate unseen classed feature
+                syn_seen_feature, syn_seen_label = generate_syn_feature(netG, data.seenclasses, data.attribute, int(opt['cls_syn_num'] / 20))
+                if opt['generalized']:
+                    # train_latent_feature_mu, train_latent_feature_logvar = netE(data.train_feature.cuda(device))
+                    # train_latent_feature = reparameterize(train_latent_feature_mu, train_latent_feature_logvar).data.cpu()
+                    train_X = torch.cat((data.train_feature, syn_unseen_feature, syn_seen_feature), 0)  # combine seen and unseen classes features
+                    train_Y = torch.cat((data.train_label, syn_unseen_label, syn_seen_label), 0)
+                    # train_X = torch.cat((data.train_feature, syn_unseen_feature),0)
+                    # train_Y = torch.cat((data.train_label, syn_unseen_label), 0)
+                    # if data.test_seen_feature.size()[-1] != opt['nz']:
+                    #     test_unseen_feature, _ = netE(data.test_unseen_feature.cuda(device))
+                    #     test_seen_feature, _ = netE(data.test_seen_feature.cuda(device))
+                    #     data.test_unseen_feature = test_unseen_feature
+                    #     data.test_seen_feature = test_seen_feature
+                    nclass = data.ntrain_class + data.ntest_class  # classes numbers
+                    v2s = s2l.Visual_to_semantic(opt, netS(train_X.cuda()).data.cpu(), train_Y, data, nclass, generalized=True)
+                    opt['gzsl_unseen_output'] = v2s.unseen_out
+                    opt['gzsl_seen_output'] = v2s.seen_out
+                    cls = classifier2.CLASSIFIER(opt, train_X, train_Y, data, nclass, _beta1=0.5, _nepoch=30, generalized=True)
+                    print(
+                        'GZSL Classifier Seen Acc: {:.2f}%, Unseen Acc: {:.2f}%, H Acc: {:.2f}%'.format(cls.seen_cls * 100,
+                                                                                                        cls.unseen_cls * 100,
+                                                                                                        cls.H_cls * 100))
+
+                    print('GZSL Ensemble Seen Acc: {:.2f}%, Unseen Acc: {:.2f}%, H Acc: {:.2f}%'.format(
+                        cls.seen_ensemble * 100, cls.unseen_ensemble * 100, cls.H_ensemble * 100))
+                    if cls.H_cls > best_H_cls:
+                        best_H_cls = cls.H_cls
+                        torch.save({'G_state_dict': netG.state_dict(),
+                                    'D_state_dict': netD.state_dict(),
+                                    'netS_state_dict': netS.state_dict(),
+                                    'H': cls.H_cls,
+                                    'gzsl_seen_accuracy': cls.seen_cls,
+                                    'gzsl_unseen_accuracy': cls.unseen_cls,
+                                    'cls': cls,
+                                    },
+                                   './checkpoint/' + 'gzsl_' + opt['dataset'] + '-' + str(epoch) + '.pth')
+                        tmp_H.append([cls.seen_cls, cls.unseen_cls, cls.H_cls])
+                        sio.savemat('./data/' + opt['dataset'] + '/fakeTestFeat.mat',
+                                    {'train_X': train_X.numpy(), 'train_Y': train_Y.numpy(),
+                                     'test_seen_X': data.test_seen_feature.numpy(),
+                                     'test_seen_Y': data.test_seen_label.numpy(),
+                                     'test_unseen_X': data.test_unseen_feature.numpy(),
+                                     'test_unseen_Y': data.test_unseen_label.numpy()})
+                else:
+                    fake_syn_unseen_attr = netS(Variable(syn_unseen_feature.cuda(), volatile=True))[0]
+                    v2s = s2l.Visual_to_semantic(opt, fake_syn_unseen_attr.data.cpu(), syn_unseen_label, data,
+                                                 data.unseenclasses.size(0), generalized=False)
+                    opt.zsl_unseen_output = v2s.output
+                    cls = classifier2.CLASSIFIER(opt, syn_unseen_feature,
+                                                 util.map_label(syn_unseen_label, data.unseenclasses),
+                                                 data, data.unseenclasses.size(0), _beta1=0.5, _nepoch=25,
+                                                 generalized=False)
+                    print('ZSL Classifier: {:.2f}%'.format(cls.cls_acc * 100))
+                    print('ZSL Ensemble: {:.2f}%'.format(cls.ensemble_acc * 100))
+                sys.stdout.flush()
+                netG.train()
+                netE.train()
+                attE.train()
+                attD.train()
+        best_H.append(tmp_H[-1])
+        print('Parameter setting: beta: {:}%, distance: {:}%, cycle: {:}%, best_acc: seen:{:.2f}%, unseen:{:.2f}%,'
+              ' H:{:.2f}%'.format(beta, distance, cycle, tmp_H[-1][0]*100, tmp_H[-1][1]*100, tmp_H[-1][-1]*100))
+        tmp_H = []
+        best_H_cls = 0.0
+    sio.savemat('./best_acc.mat',
+            {   'para':itertools.product(beta, distance, cycle),
+                'acc':best_H,
+            })
+Random Seed:  9182
+MLP_G(
+  (fc1): Linear(in_features=128, out_features=4096, bias=True)
+  (fc2): Linear(in_features=4096, out_features=2048, bias=True)
+  (lrelu): LeakyReLU(negative_slope=0.2, inplace=True)
+  (relu): ReLU(inplace=True)
+  (sigmoid): Sigmoid()
+)
+MLP_D(
+  (fc1): Linear(in_features=2112, out_features=1024, bias=True)
+  (fc2): Linear(in_features=1024, out_features=1, bias=True)
+  (lrelu): LeakyReLU(negative_slope=0.2, inplace=True)
+  (sigoid): Sigmoid()
+)
+MLP_D2(
+  (fc1): Linear(in_features=64, out_features=1024, bias=True)
+  (fc2): Linear(in_features=1024, out_features=1, bias=True)
+  (lrelu): LeakyReLU(negative_slope=0.2, inplace=True)
+  (sigmoid): Sigmoid()
+)
+Encoder(
+  (fc1): Linear(in_features=2048, out_features=4096, bias=True)
+  (fc2): Linear(in_features=4096, out_features=64, bias=True)
+  (lrelu): LeakyReLU(negative_slope=0.2, inplace=True)
+  (_mu): Linear(in_features=4096, out_features=64, bias=True)
+  (_logvar): Linear(in_features=4096, out_features=64, bias=True)
+)
+Forward Seen:3.30%, Unseen:3.03%, H:3.16%
+EP[0/150]*******************************************************************
+G_cost: -12.0463, D2_loss: 2.0669, vae_loss: 3694.8101, loss: 3684.8306
+V2S Softmax Seen Acc:23.57, Unseen Acc:7.49, H Acc:11.36
+GZSL Classifier Seen Acc: 59.30%, Unseen Acc: 27.74%, H Acc: 37.80%
+GZSL Ensemble Seen Acc: 61.72%, Unseen Acc: 16.76%, H Acc: 26.36%
+EP[1/150]*******************************************************************
+G_cost: -7.2898, D2_loss: 1.5167, vae_loss: 3739.9663, loss: 3734.1931
+V2S Softmax Seen Acc:23.71, Unseen Acc:8.36, H Acc:12.37
+GZSL Classifier Seen Acc: 63.18%, Unseen Acc: 27.18%, H Acc: 38.01%
+GZSL Ensemble Seen Acc: 60.04%, Unseen Acc: 18.53%, H Acc: 28.32%
+EP[2/150]*******************************************************************
+G_cost: -5.0804, D2_loss: 1.7727, vae_loss: 3705.4116, loss: 3702.1038
+V2S Softmax Seen Acc:23.54, Unseen Acc:8.84, H Acc:12.86
+GZSL Classifier Seen Acc: 63.31%, Unseen Acc: 27.95%, H Acc: 38.78%
+GZSL Ensemble Seen Acc: 65.24%, Unseen Acc: 17.94%, H Acc: 28.14%
+EP[3/150]*******************************************************************
+G_cost: -5.6342, D2_loss: 3.1863, vae_loss: 3705.2729, loss: 3702.8250
+V2S Softmax Seen Acc:22.01, Unseen Acc:9.55, H Acc:13.32
+GZSL Classifier Seen Acc: 57.13%, Unseen Acc: 30.94%, H Acc: 40.14%
+GZSL Ensemble Seen Acc: 53.83%, Unseen Acc: 20.71%, H Acc: 29.92%
+EP[4/150]*******************************************************************
+G_cost: -3.0915, D2_loss: 1.8333, vae_loss: 3794.0981, loss: 3792.8398
+V2S Softmax Seen Acc:22.31, Unseen Acc:10.84, H Acc:14.59
+GZSL Classifier Seen Acc: 58.61%, Unseen Acc: 30.35%, H Acc: 39.99%
+GZSL Ensemble Seen Acc: 57.09%, Unseen Acc: 21.13%, H Acc: 30.85%
+EP[5/150]*******************************************************************
+G_cost: -1.1555, D2_loss: 1.9848, vae_loss: 3756.7549, loss: 3757.5842
+V2S Softmax Seen Acc:23.76, Unseen Acc:10.40, H Acc:14.46
+GZSL Classifier Seen Acc: 59.36%, Unseen Acc: 31.02%, H Acc: 40.74%
+GZSL Ensemble Seen Acc: 57.50%, Unseen Acc: 21.91%, H Acc: 31.73%
+EP[6/150]*******************************************************************
+G_cost: 3.6227, D2_loss: 2.1456, vae_loss: 3736.7451, loss: 3742.5134
+V2S Softmax Seen Acc:26.66, Unseen Acc:10.34, H Acc:14.90
+GZSL Classifier Seen Acc: 64.26%, Unseen Acc: 29.62%, H Acc: 40.55%
+GZSL Ensemble Seen Acc: 56.43%, Unseen Acc: 20.90%, H Acc: 30.50%
+EP[7/150]*******************************************************************
+G_cost: 6.8813, D2_loss: 1.5977, vae_loss: 3679.8423, loss: 3688.3213
+V2S Softmax Seen Acc:19.17, Unseen Acc:10.86, H Acc:13.87
+GZSL Classifier Seen Acc: 59.09%, Unseen Acc: 31.00%, H Acc: 40.67%
+GZSL Ensemble Seen Acc: 58.39%, Unseen Acc: 22.34%, H Acc: 32.32%
+EP[8/150]*******************************************************************
+G_cost: 10.3981, D2_loss: 1.8590, vae_loss: 3614.7764, loss: 3627.0332
+V2S Softmax Seen Acc:26.05, Unseen Acc:10.45, H Acc:14.91
+GZSL Classifier Seen Acc: 64.19%, Unseen Acc: 30.62%, H Acc: 41.46%
+GZSL Ensemble Seen Acc: 58.87%, Unseen Acc: 21.27%, H Acc: 31.25%
+EP[9/150]*******************************************************************
+G_cost: 12.2486, D2_loss: 1.5586, vae_loss: 3740.6118, loss: 3754.4189
+V2S Softmax Seen Acc:19.30, Unseen Acc:11.56, H Acc:14.46
+GZSL Classifier Seen Acc: 60.73%, Unseen Acc: 30.85%, H Acc: 40.91%
+GZSL Ensemble Seen Acc: 61.76%, Unseen Acc: 22.18%, H Acc: 32.64%
+EP[10/150]*******************************************************************
+G_cost: 13.6302, D2_loss: 2.0163, vae_loss: 3660.9897, loss: 3676.6362
+V2S Softmax Seen Acc:24.94, Unseen Acc:10.35, H Acc:14.63
+GZSL Classifier Seen Acc: 65.51%, Unseen Acc: 29.38%, H Acc: 40.57%
+GZSL Ensemble Seen Acc: 55.94%, Unseen Acc: 21.37%, H Acc: 30.93%
+EP[11/150]*******************************************************************
+G_cost: 13.0439, D2_loss: 1.6999, vae_loss: 3714.2419, loss: 3728.9858
+V2S Softmax Seen Acc:24.65, Unseen Acc:10.81, H Acc:15.02
+GZSL Classifier Seen Acc: 60.27%, Unseen Acc: 30.58%, H Acc: 40.58%
+GZSL Ensemble Seen Acc: 59.27%, Unseen Acc: 20.43%, H Acc: 30.39%
+EP[12/150]*******************************************************************
+G_cost: 12.0689, D2_loss: 1.8951, vae_loss: 3697.0122, loss: 3710.9761
+V2S Softmax Seen Acc:28.05, Unseen Acc:10.42, H Acc:15.20
+GZSL Classifier Seen Acc: 60.19%, Unseen Acc: 30.77%, H Acc: 40.72%
+GZSL Ensemble Seen Acc: 59.74%, Unseen Acc: 19.90%, H Acc: 29.86%
+EP[13/150]*******************************************************************
+G_cost: 12.1304, D2_loss: 1.8134, vae_loss: 3804.2178, loss: 3818.1616
+V2S Softmax Seen Acc:23.03, Unseen Acc:11.56, H Acc:15.39
+GZSL Classifier Seen Acc: 60.23%, Unseen Acc: 30.89%, H Acc: 40.84%
+GZSL Ensemble Seen Acc: 59.85%, Unseen Acc: 20.81%, H Acc: 30.89%
+EP[14/150]*******************************************************************
+G_cost: 11.8445, D2_loss: 1.8318, vae_loss: 3764.0210, loss: 3777.6973
+V2S Softmax Seen Acc:22.79, Unseen Acc:11.24, H Acc:15.05
+GZSL Classifier Seen Acc: 61.26%, Unseen Acc: 29.37%, H Acc: 39.70%
+GZSL Ensemble Seen Acc: 55.89%, Unseen Acc: 20.81%, H Acc: 30.33%
+EP[15/150]*******************************************************************
+G_cost: 10.7487, D2_loss: 2.0849, vae_loss: 3669.2002, loss: 3682.0339
+V2S Softmax Seen Acc:19.77, Unseen Acc:11.77, H Acc:14.76
+GZSL Classifier Seen Acc: 61.49%, Unseen Acc: 30.51%, H Acc: 40.79%
+GZSL Ensemble Seen Acc: 59.12%, Unseen Acc: 21.98%, H Acc: 32.05%
+EP[16/150]*******************************************************************
+G_cost: 10.1986, D2_loss: 1.7571, vae_loss: 3745.9185, loss: 3757.8740
+V2S Softmax Seen Acc:25.02, Unseen Acc:11.18, H Acc:15.45
+GZSL Classifier Seen Acc: 60.26%, Unseen Acc: 32.06%, H Acc: 41.85%
+GZSL Ensemble Seen Acc: 49.64%, Unseen Acc: 21.58%, H Acc: 30.08%
+EP[17/150]*******************************************************************
+G_cost: 9.2098, D2_loss: 1.7682, vae_loss: 3635.0479, loss: 3646.0261
+V2S Softmax Seen Acc:26.63, Unseen Acc:10.85, H Acc:15.42
+GZSL Classifier Seen Acc: 64.82%, Unseen Acc: 29.84%, H Acc: 40.87%
+GZSL Ensemble Seen Acc: 54.64%, Unseen Acc: 20.36%, H Acc: 29.66%
+EP[18/150]*******************************************************************
+G_cost: 9.2695, D2_loss: 1.8956, vae_loss: 3707.3350, loss: 3718.5000
+V2S Softmax Seen Acc:24.21, Unseen Acc:11.07, H Acc:15.19
+GZSL Classifier Seen Acc: 58.90%, Unseen Acc: 30.93%, H Acc: 40.56%
+GZSL Ensemble Seen Acc: 65.65%, Unseen Acc: 19.87%, H Acc: 30.51%
+EP[19/150]*******************************************************************
+G_cost: 8.0881, D2_loss: 1.9742, vae_loss: 3640.7500, loss: 3650.8123
+V2S Softmax Seen Acc:19.92, Unseen Acc:12.05, H Acc:15.01
+GZSL Classifier Seen Acc: 58.78%, Unseen Acc: 30.99%, H Acc: 40.59%
+GZSL Ensemble Seen Acc: 62.51%, Unseen Acc: 20.49%, H Acc: 30.86%
+EP[20/150]*******************************************************************
+G_cost: 7.9479, D2_loss: 1.6628, vae_loss: 3699.8945, loss: 3709.5054
+V2S Softmax Seen Acc:23.59, Unseen Acc:12.19, H Acc:16.07
+GZSL Classifier Seen Acc: 64.67%, Unseen Acc: 29.44%, H Acc: 40.46%
+GZSL Ensemble Seen Acc: 54.54%, Unseen Acc: 20.02%, H Acc: 29.29%
+EP[21/150]*******************************************************************
+G_cost: 6.3012, D2_loss: 1.6276, vae_loss: 3712.7837, loss: 3720.7126
+V2S Softmax Seen Acc:20.97, Unseen Acc:12.17, H Acc:15.40
+GZSL Classifier Seen Acc: 58.71%, Unseen Acc: 32.24%, H Acc: 41.62%
+GZSL Ensemble Seen Acc: 51.16%, Unseen Acc: 21.06%, H Acc: 29.84%
+EP[22/150]*******************************************************************
+G_cost: 6.5804, D2_loss: 1.6906, vae_loss: 3811.2825, loss: 3819.5535
+V2S Softmax Seen Acc:22.24, Unseen Acc:12.92, H Acc:16.34
+GZSL Classifier Seen Acc: 63.46%, Unseen Acc: 29.89%, H Acc: 40.64%
+GZSL Ensemble Seen Acc: 51.50%, Unseen Acc: 20.99%, H Acc: 29.83%
+EP[23/150]*******************************************************************
+G_cost: 6.1152, D2_loss: 1.9860, vae_loss: 3619.9707, loss: 3628.0720
+V2S Softmax Seen Acc:22.46, Unseen Acc:12.71, H Acc:16.24
+GZSL Classifier Seen Acc: 63.89%, Unseen Acc: 29.69%, H Acc: 40.54%
+GZSL Ensemble Seen Acc: 53.82%, Unseen Acc: 19.83%, H Acc: 28.99%
+EP[24/150]*******************************************************************
+G_cost: 4.6034, D2_loss: 1.9899, vae_loss: 3654.2859, loss: 3660.8794
+V2S Softmax Seen Acc:21.44, Unseen Acc:12.74, H Acc:15.98
+GZSL Classifier Seen Acc: 56.46%, Unseen Acc: 30.99%, H Acc: 40.02%
+GZSL Ensemble Seen Acc: 47.58%, Unseen Acc: 21.41%, H Acc: 29.53%
+EP[25/150]*******************************************************************
+G_cost: 4.9535, D2_loss: 1.7180, vae_loss: 3791.4597, loss: 3798.1313
+V2S Softmax Seen Acc:27.41, Unseen Acc:12.06, H Acc:16.75
+GZSL Classifier Seen Acc: 51.52%, Unseen Acc: 31.37%, H Acc: 39.00%
+GZSL Ensemble Seen Acc: 53.26%, Unseen Acc: 19.10%, H Acc: 28.12%
+EP[26/150]*******************************************************************
+G_cost: 4.3487, D2_loss: 1.7015, vae_loss: 3776.5554, loss: 3782.6055
+V2S Softmax Seen Acc:20.67, Unseen Acc:13.17, H Acc:16.09
+GZSL Classifier Seen Acc: 51.23%, Unseen Acc: 32.20%, H Acc: 39.54%
+GZSL Ensemble Seen Acc: 49.28%, Unseen Acc: 21.22%, H Acc: 29.67%
+EP[27/150]*******************************************************************
+G_cost: 3.0069, D2_loss: 1.8143, vae_loss: 3686.5774, loss: 3691.3984
+V2S Softmax Seen Acc:23.83, Unseen Acc:12.66, H Acc:16.53
+GZSL Classifier Seen Acc: 57.08%, Unseen Acc: 31.15%, H Acc: 40.30%
+GZSL Ensemble Seen Acc: 52.02%, Unseen Acc: 20.10%, H Acc: 29.00%
+EP[28/150]*******************************************************************
+G_cost: 2.7997, D2_loss: 1.6686, vae_loss: 3655.7942, loss: 3660.2627
+V2S Softmax Seen Acc:26.61, Unseen Acc:11.80, H Acc:16.35
+GZSL Classifier Seen Acc: 52.15%, Unseen Acc: 32.74%, H Acc: 40.22%
+GZSL Ensemble Seen Acc: 54.24%, Unseen Acc: 19.00%, H Acc: 28.15%
+EP[29/150]*******************************************************************
+G_cost: 2.7995, D2_loss: 1.8228, vae_loss: 3670.5269, loss: 3675.1492
+V2S Softmax Seen Acc:25.61, Unseen Acc:12.30, H Acc:16.62
+GZSL Classifier Seen Acc: 58.10%, Unseen Acc: 29.05%, H Acc: 38.73%
+GZSL Ensemble Seen Acc: 52.18%, Unseen Acc: 19.13%, H Acc: 28.00%
+EP[30/150]*******************************************************************
+G_cost: 2.5060, D2_loss: 1.8625, vae_loss: 3859.6157, loss: 3863.9844
+V2S Softmax Seen Acc:27.05, Unseen Acc:12.35, H Acc:16.96
+GZSL Classifier Seen Acc: 59.65%, Unseen Acc: 29.08%, H Acc: 39.10%
+GZSL Ensemble Seen Acc: 44.44%, Unseen Acc: 19.71%, H Acc: 27.31%
+EP[31/150]*******************************************************************
+G_cost: 1.5120, D2_loss: 1.7875, vae_loss: 3794.7173, loss: 3798.0168
+V2S Softmax Seen Acc:27.34, Unseen Acc:12.05, H Acc:16.73
+GZSL Classifier Seen Acc: 57.55%, Unseen Acc: 28.65%, H Acc: 38.26%
+GZSL Ensemble Seen Acc: 54.50%, Unseen Acc: 18.42%, H Acc: 27.54%
+EP[32/150]*******************************************************************
+G_cost: 1.2178, D2_loss: 1.8203, vae_loss: 3688.2078, loss: 3691.2458
+V2S Softmax Seen Acc:27.20, Unseen Acc:12.33, H Acc:16.97
+GZSL Classifier Seen Acc: 63.57%, Unseen Acc: 28.49%, H Acc: 39.35%
+GZSL Ensemble Seen Acc: 52.14%, Unseen Acc: 18.92%, H Acc: 27.76%
+EP[33/150]*******************************************************************
+G_cost: 1.9883, D2_loss: 1.8259, vae_loss: 3787.5737, loss: 3791.3879
+V2S Softmax Seen Acc:26.13, Unseen Acc:12.35, H Acc:16.77
+GZSL Classifier Seen Acc: 58.99%, Unseen Acc: 28.17%, H Acc: 38.13%
+GZSL Ensemble Seen Acc: 51.75%, Unseen Acc: 18.64%, H Acc: 27.41%
+EP[34/150]*******************************************************************
+G_cost: 1.3569, D2_loss: 1.7238, vae_loss: 3665.7451, loss: 3668.8259
+V2S Softmax Seen Acc:25.35, Unseen Acc:13.01, H Acc:17.19
+GZSL Classifier Seen Acc: 57.29%, Unseen Acc: 28.70%, H Acc: 38.24%
+GZSL Ensemble Seen Acc: 64.60%, Unseen Acc: 17.84%, H Acc: 27.96%
+EP[35/150]*******************************************************************
+G_cost: 2.3417, D2_loss: 1.7819, vae_loss: 3573.0481, loss: 3577.1719
+V2S Softmax Seen Acc:27.36, Unseen Acc:11.98, H Acc:16.67
+GZSL Classifier Seen Acc: 51.06%, Unseen Acc: 30.76%, H Acc: 38.39%
+GZSL Ensemble Seen Acc: 54.59%, Unseen Acc: 18.16%, H Acc: 27.25%
+EP[36/150]*******************************************************************
+G_cost: 1.9503, D2_loss: 2.1053, vae_loss: 3636.5144, loss: 3640.5701
+V2S Softmax Seen Acc:29.36, Unseen Acc:12.73, H Acc:17.76
+GZSL Classifier Seen Acc: 52.83%, Unseen Acc: 30.03%, H Acc: 38.29%
+GZSL Ensemble Seen Acc: 58.71%, Unseen Acc: 17.50%, H Acc: 26.96%
+EP[37/150]*******************************************************************
+G_cost: 2.7693, D2_loss: 1.8930, vae_loss: 3798.8765, loss: 3803.5388
+V2S Softmax Seen Acc:28.27, Unseen Acc:12.59, H Acc:17.42
+GZSL Classifier Seen Acc: 52.09%, Unseen Acc: 30.65%, H Acc: 38.59%
+GZSL Ensemble Seen Acc: 55.88%, Unseen Acc: 18.86%, H Acc: 28.21%
+EP[38/150]*******************************************************************
+G_cost: 1.4510, D2_loss: 2.1291, vae_loss: 3599.9075, loss: 3603.4875
+V2S Softmax Seen Acc:32.66, Unseen Acc:11.97, H Acc:17.52
+GZSL Classifier Seen Acc: 50.99%, Unseen Acc: 29.79%, H Acc: 37.61%
+GZSL Ensemble Seen Acc: 51.56%, Unseen Acc: 17.48%, H Acc: 26.10%
+EP[39/150]*******************************************************************
+G_cost: 2.2720, D2_loss: 2.0835, vae_loss: 3701.0186, loss: 3705.3740
+V2S Softmax Seen Acc:31.60, Unseen Acc:11.44, H Acc:16.79
+GZSL Classifier Seen Acc: 57.97%, Unseen Acc: 28.83%, H Acc: 38.51%
+GZSL Ensemble Seen Acc: 67.59%, Unseen Acc: 15.78%, H Acc: 25.59%
+EP[40/150]*******************************************************************
+G_cost: 1.5744, D2_loss: 2.1931, vae_loss: 3648.0493, loss: 3651.8169
+V2S Softmax Seen Acc:27.99, Unseen Acc:12.88, H Acc:17.64
+GZSL Classifier Seen Acc: 51.33%, Unseen Acc: 31.13%, H Acc: 38.76%
+GZSL Ensemble Seen Acc: 52.28%, Unseen Acc: 18.35%, H Acc: 27.16%
+EP[41/150]*******************************************************************
+G_cost: 1.6939, D2_loss: 2.1426, vae_loss: 3746.6292, loss: 3750.4656
+V2S Softmax Seen Acc:27.24, Unseen Acc:13.11, H Acc:17.70
+GZSL Classifier Seen Acc: 58.06%, Unseen Acc: 29.03%, H Acc: 38.71%
+GZSL Ensemble Seen Acc: 53.56%, Unseen Acc: 18.63%, H Acc: 27.64%
+EP[42/150]*******************************************************************
+G_cost: 2.1217, D2_loss: 2.2983, vae_loss: 3690.5637, loss: 3694.9836
+V2S Softmax Seen Acc:28.78, Unseen Acc:12.82, H Acc:17.73
+GZSL Classifier Seen Acc: 49.92%, Unseen Acc: 31.85%, H Acc: 38.89%
+GZSL Ensemble Seen Acc: 53.24%, Unseen Acc: 18.83%, H Acc: 27.81%
+EP[43/150]*******************************************************************
+G_cost: 1.9320, D2_loss: 2.0829, vae_loss: 3661.3921, loss: 3665.4067
+V2S Softmax Seen Acc:28.64, Unseen Acc:12.24, H Acc:17.15
+GZSL Classifier Seen Acc: 52.60%, Unseen Acc: 30.60%, H Acc: 38.69%
+GZSL Ensemble Seen Acc: 50.18%, Unseen Acc: 18.07%, H Acc: 26.57%
+EP[44/150]*******************************************************************
+G_cost: 1.4665, D2_loss: 2.2038, vae_loss: 3800.3486, loss: 3804.0190
+V2S Softmax Seen Acc:26.90, Unseen Acc:12.82, H Acc:17.37
+GZSL Classifier Seen Acc: 50.93%, Unseen Acc: 30.56%, H Acc: 38.20%
+GZSL Ensemble Seen Acc: 49.66%, Unseen Acc: 18.68%, H Acc: 27.15%
+EP[45/150]*******************************************************************
+G_cost: 1.4962, D2_loss: 2.2256, vae_loss: 3668.6235, loss: 3672.3452
+V2S Softmax Seen Acc:33.04, Unseen Acc:11.95, H Acc:17.55
+GZSL Classifier Seen Acc: 53.15%, Unseen Acc: 31.86%, H Acc: 39.84%
+GZSL Ensemble Seen Acc: 56.05%, Unseen Acc: 17.42%, H Acc: 26.58%
+EP[46/150]*******************************************************************
+G_cost: 2.2504, D2_loss: 2.2376, vae_loss: 3721.4810, loss: 3725.9690
+V2S Softmax Seen Acc:28.24, Unseen Acc:13.03, H Acc:17.83
+GZSL Classifier Seen Acc: 60.54%, Unseen Acc: 27.84%, H Acc: 38.14%
+GZSL Ensemble Seen Acc: 52.07%, Unseen Acc: 18.43%, H Acc: 27.22%
+EP[47/150]*******************************************************************
+G_cost: 2.1990, D2_loss: 2.2858, vae_loss: 3689.6724, loss: 3694.1572
+V2S Softmax Seen Acc:33.10, Unseen Acc:12.23, H Acc:17.86
+GZSL Classifier Seen Acc: 52.34%, Unseen Acc: 30.48%, H Acc: 38.53%
+GZSL Ensemble Seen Acc: 57.21%, Unseen Acc: 17.79%, H Acc: 27.14%
+EP[48/150]*******************************************************************
+G_cost: 2.7714, D2_loss: 2.3577, vae_loss: 3708.8228, loss: 3713.9519
+V2S Softmax Seen Acc:29.36, Unseen Acc:13.37, H Acc:18.38
+GZSL Classifier Seen Acc: 59.45%, Unseen Acc: 28.63%, H Acc: 38.65%
+GZSL Ensemble Seen Acc: 59.89%, Unseen Acc: 18.66%, H Acc: 28.45%
+EP[49/150]*******************************************************************
+G_cost: 2.1725, D2_loss: 2.4071, vae_loss: 3768.0020, loss: 3772.5815
+V2S Softmax Seen Acc:29.59, Unseen Acc:13.05, H Acc:18.11
+GZSL Classifier Seen Acc: 58.77%, Unseen Acc: 28.39%, H Acc: 38.29%
+GZSL Ensemble Seen Acc: 53.30%, Unseen Acc: 19.31%, H Acc: 28.35%
+EP[50/150]*******************************************************************
+G_cost: 2.4026, D2_loss: 2.3491, vae_loss: 3699.3193, loss: 3704.0710
+V2S Softmax Seen Acc:27.63, Unseen Acc:12.81, H Acc:17.51
+GZSL Classifier Seen Acc: 51.49%, Unseen Acc: 30.40%, H Acc: 38.23%
+GZSL Ensemble Seen Acc: 60.79%, Unseen Acc: 18.10%, H Acc: 27.90%
+EP[51/150]*******************************************************************
+G_cost: 2.3907, D2_loss: 2.4645, vae_loss: 3725.7734, loss: 3730.6284
+V2S Softmax Seen Acc:34.20, Unseen Acc:12.00, H Acc:17.77
+GZSL Classifier Seen Acc: 57.46%, Unseen Acc: 28.48%, H Acc: 38.08%
+GZSL Ensemble Seen Acc: 51.41%, Unseen Acc: 17.68%, H Acc: 26.32%
+EP[52/150]*******************************************************************
+G_cost: 2.8492, D2_loss: 2.3431, vae_loss: 3724.0620, loss: 3729.2544
+V2S Softmax Seen Acc:27.84, Unseen Acc:13.00, H Acc:17.72
+GZSL Classifier Seen Acc: 52.70%, Unseen Acc: 29.86%, H Acc: 38.12%
+GZSL Ensemble Seen Acc: 51.50%, Unseen Acc: 18.86%, H Acc: 27.61%
+EP[53/150]*******************************************************************
+G_cost: 2.7972, D2_loss: 2.5958, vae_loss: 3764.2896, loss: 3769.6824
+V2S Softmax Seen Acc:27.29, Unseen Acc:13.97, H Acc:18.48
+GZSL Classifier Seen Acc: 52.94%, Unseen Acc: 29.10%, H Acc: 37.55%
+GZSL Ensemble Seen Acc: 52.64%, Unseen Acc: 19.16%, H Acc: 28.09%
+EP[54/150]*******************************************************************
+G_cost: 3.5029, D2_loss: 2.5022, vae_loss: 3610.8179, loss: 3616.8230
+V2S Softmax Seen Acc:26.84, Unseen Acc:13.54, H Acc:18.00
+GZSL Classifier Seen Acc: 52.89%, Unseen Acc: 28.92%, H Acc: 37.40%
+GZSL Ensemble Seen Acc: 53.24%, Unseen Acc: 18.69%, H Acc: 27.67%
+EP[55/150]*******************************************************************
+G_cost: 3.6066, D2_loss: 2.5142, vae_loss: 3798.3855, loss: 3804.5063
+V2S Softmax Seen Acc:28.16, Unseen Acc:13.07, H Acc:17.85
+GZSL Classifier Seen Acc: 50.97%, Unseen Acc: 29.26%, H Acc: 37.18%
+GZSL Ensemble Seen Acc: 50.01%, Unseen Acc: 18.99%, H Acc: 27.53%
+EP[56/150]*******************************************************************
+G_cost: 4.3444, D2_loss: 2.7491, vae_loss: 3672.7754, loss: 3679.8689
+V2S Softmax Seen Acc:30.26, Unseen Acc:12.72, H Acc:17.91
+GZSL Classifier Seen Acc: 52.77%, Unseen Acc: 27.49%, H Acc: 36.15%
+GZSL Ensemble Seen Acc: 52.43%, Unseen Acc: 18.30%, H Acc: 27.13%
+EP[57/150]*******************************************************************
+G_cost: 4.5643, D2_loss: 2.6619, vae_loss: 3808.3154, loss: 3815.5415
+V2S Softmax Seen Acc:29.40, Unseen Acc:12.66, H Acc:17.70
+GZSL Classifier Seen Acc: 52.09%, Unseen Acc: 29.28%, H Acc: 37.49%
+GZSL Ensemble Seen Acc: 52.39%, Unseen Acc: 18.35%, H Acc: 27.18%
+EP[58/150]*******************************************************************
+G_cost: 4.6960, D2_loss: 2.4507, vae_loss: 3694.1567, loss: 3701.3035
+V2S Softmax Seen Acc:30.40, Unseen Acc:12.90, H Acc:18.12
+GZSL Classifier Seen Acc: 53.31%, Unseen Acc: 30.17%, H Acc: 38.53%
+GZSL Ensemble Seen Acc: 58.47%, Unseen Acc: 18.87%, H Acc: 28.53%
+EP[59/150]*******************************************************************
+G_cost: 4.0005, D2_loss: 2.6232, vae_loss: 3711.9041, loss: 3718.5276
+V2S Softmax Seen Acc:28.65, Unseen Acc:13.57, H Acc:18.42
+GZSL Classifier Seen Acc: 50.08%, Unseen Acc: 28.99%, H Acc: 36.72%
+GZSL Ensemble Seen Acc: 51.47%, Unseen Acc: 18.82%, H Acc: 27.56%
+EP[60/150]*******************************************************************
+G_cost: 4.0840, D2_loss: 2.6208, vae_loss: 3719.6597, loss: 3726.3645
+V2S Softmax Seen Acc:26.14, Unseen Acc:12.73, H Acc:17.12
+GZSL Classifier Seen Acc: 53.18%, Unseen Acc: 29.77%, H Acc: 38.17%
+GZSL Ensemble Seen Acc: 57.50%, Unseen Acc: 18.18%, H Acc: 27.63%
+EP[61/150]*******************************************************************
+G_cost: 3.8882, D2_loss: 2.6953, vae_loss: 3630.0308, loss: 3636.6143
+V2S Softmax Seen Acc:29.06, Unseen Acc:13.27, H Acc:18.22
+GZSL Classifier Seen Acc: 59.11%, Unseen Acc: 27.70%, H Acc: 37.72%
+GZSL Ensemble Seen Acc: 56.29%, Unseen Acc: 18.72%, H Acc: 28.09%
+EP[62/150]*******************************************************************
+G_cost: 4.2451, D2_loss: 2.6232, vae_loss: 3635.0771, loss: 3641.9456
+V2S Softmax Seen Acc:25.85, Unseen Acc:13.37, H Acc:17.62
+GZSL Classifier Seen Acc: 59.41%, Unseen Acc: 27.63%, H Acc: 37.72%
+GZSL Ensemble Seen Acc: 56.11%, Unseen Acc: 18.80%, H Acc: 28.16%
+EP[63/150]*******************************************************************
+G_cost: 4.1439, D2_loss: 2.5516, vae_loss: 3743.6365, loss: 3750.3323
+V2S Softmax Seen Acc:29.24, Unseen Acc:12.90, H Acc:17.90
+GZSL Classifier Seen Acc: 52.83%, Unseen Acc: 29.07%, H Acc: 37.50%
+GZSL Ensemble Seen Acc: 53.23%, Unseen Acc: 18.25%, H Acc: 27.18%
+EP[64/150]*******************************************************************
+G_cost: 3.3491, D2_loss: 2.6220, vae_loss: 3671.2417, loss: 3677.2129
+V2S Softmax Seen Acc:27.02, Unseen Acc:13.61, H Acc:18.10
+GZSL Classifier Seen Acc: 50.65%, Unseen Acc: 29.62%, H Acc: 37.38%
+GZSL Ensemble Seen Acc: 52.31%, Unseen Acc: 18.49%, H Acc: 27.33%
+EP[65/150]*******************************************************************
+G_cost: 4.6111, D2_loss: 2.6796, vae_loss: 3627.3879, loss: 3634.6787
+V2S Softmax Seen Acc:26.75, Unseen Acc:13.10, H Acc:17.59
+GZSL Classifier Seen Acc: 51.58%, Unseen Acc: 29.73%, H Acc: 37.72%
+GZSL Ensemble Seen Acc: 52.52%, Unseen Acc: 19.38%, H Acc: 28.31%
+EP[66/150]*******************************************************************
+G_cost: 5.4690, D2_loss: 2.8697, vae_loss: 3540.2529, loss: 3548.5916
+V2S Softmax Seen Acc:26.98, Unseen Acc:13.45, H Acc:17.95
+GZSL Classifier Seen Acc: 52.55%, Unseen Acc: 29.43%, H Acc: 37.73%
+GZSL Ensemble Seen Acc: 52.08%, Unseen Acc: 19.33%, H Acc: 28.19%
+EP[67/150]*******************************************************************
+G_cost: 4.0773, D2_loss: 2.8484, vae_loss: 3668.2886, loss: 3675.2144
+V2S Softmax Seen Acc:28.34, Unseen Acc:13.70, H Acc:18.47
+GZSL Classifier Seen Acc: 51.12%, Unseen Acc: 29.24%, H Acc: 37.20%
+GZSL Ensemble Seen Acc: 51.70%, Unseen Acc: 18.58%, H Acc: 27.33%
+EP[68/150]*******************************************************************
+G_cost: 4.7440, D2_loss: 2.6251, vae_loss: 3719.2876, loss: 3726.6565
+V2S Softmax Seen Acc:27.90, Unseen Acc:13.51, H Acc:18.20
+GZSL Classifier Seen Acc: 53.19%, Unseen Acc: 29.86%, H Acc: 38.25%
+GZSL Ensemble Seen Acc: 52.49%, Unseen Acc: 18.60%, H Acc: 27.47%
+EP[69/150]*******************************************************************
+G_cost: 4.8679, D2_loss: 2.6086, vae_loss: 3642.6938, loss: 3650.1704
+V2S Softmax Seen Acc:27.07, Unseen Acc:13.38, H Acc:17.90
+GZSL Classifier Seen Acc: 58.19%, Unseen Acc: 27.46%, H Acc: 37.32%
+GZSL Ensemble Seen Acc: 53.86%, Unseen Acc: 18.62%, H Acc: 27.67%
+EP[70/150]*******************************************************************
+G_cost: 3.5825, D2_loss: 2.6879, vae_loss: 3645.8000, loss: 3652.0706
+V2S Softmax Seen Acc:24.94, Unseen Acc:13.95, H Acc:17.89
+GZSL Classifier Seen Acc: 53.26%, Unseen Acc: 27.63%, H Acc: 36.39%
+GZSL Ensemble Seen Acc: 53.43%, Unseen Acc: 18.60%, H Acc: 27.60%
+EP[71/150]*******************************************************************
+G_cost: 4.0318, D2_loss: 2.6641, vae_loss: 3782.8481, loss: 3789.5439
+V2S Softmax Seen Acc:27.13, Unseen Acc:13.60, H Acc:18.12
+GZSL Classifier Seen Acc: 52.37%, Unseen Acc: 28.87%, H Acc: 37.22%
+GZSL Ensemble Seen Acc: 51.51%, Unseen Acc: 19.09%, H Acc: 27.86%
+EP[72/150]*******************************************************************
+G_cost: 4.8714, D2_loss: 2.5507, vae_loss: 3695.4653, loss: 3702.8875
+V2S Softmax Seen Acc:25.51, Unseen Acc:13.97, H Acc:18.06
+GZSL Classifier Seen Acc: 51.87%, Unseen Acc: 28.73%, H Acc: 36.98%
+GZSL Ensemble Seen Acc: 54.25%, Unseen Acc: 19.10%, H Acc: 28.25%
+EP[73/150]*******************************************************************
+G_cost: 4.2162, D2_loss: 2.5404, vae_loss: 3681.6274, loss: 3688.3840
+V2S Softmax Seen Acc:25.18, Unseen Acc:13.88, H Acc:17.90
+GZSL Classifier Seen Acc: 52.43%, Unseen Acc: 29.20%, H Acc: 37.51%
+GZSL Ensemble Seen Acc: 54.76%, Unseen Acc: 19.13%, H Acc: 28.36%
+EP[74/150]*******************************************************************
+G_cost: 5.0997, D2_loss: 2.4952, vae_loss: 3711.3076, loss: 3718.9023
+V2S Softmax Seen Acc:23.95, Unseen Acc:13.90, H Acc:17.59
+GZSL Classifier Seen Acc: 51.83%, Unseen Acc: 28.35%, H Acc: 36.65%
+GZSL Ensemble Seen Acc: 52.10%, Unseen Acc: 19.05%, H Acc: 27.90%
+EP[75/150]*******************************************************************
+G_cost: 5.6280, D2_loss: 2.6105, vae_loss: 3848.3364, loss: 3856.5750
+V2S Softmax Seen Acc:23.54, Unseen Acc:14.42, H Acc:17.88
+GZSL Classifier Seen Acc: 58.31%, Unseen Acc: 27.01%, H Acc: 36.92%
+GZSL Ensemble Seen Acc: 51.95%, Unseen Acc: 19.87%, H Acc: 28.75%
+EP[76/150]*******************************************************************
+G_cost: 4.2830, D2_loss: 2.6737, vae_loss: 3613.6025, loss: 3620.5591
+V2S Softmax Seen Acc:25.13, Unseen Acc:13.57, H Acc:17.63
+GZSL Classifier Seen Acc: 51.69%, Unseen Acc: 29.23%, H Acc: 37.34%
+GZSL Ensemble Seen Acc: 51.42%, Unseen Acc: 19.15%, H Acc: 27.91%
+EP[77/150]*******************************************************************
+G_cost: 4.3868, D2_loss: 2.6393, vae_loss: 3665.6636, loss: 3672.6897
+V2S Softmax Seen Acc:23.45, Unseen Acc:13.73, H Acc:17.32
+GZSL Classifier Seen Acc: 51.19%, Unseen Acc: 27.46%, H Acc: 35.75%
+GZSL Ensemble Seen Acc: 53.31%, Unseen Acc: 18.60%, H Acc: 27.57%
+EP[78/150]*******************************************************************
+G_cost: 3.9885, D2_loss: 2.7741, vae_loss: 3675.1904, loss: 3681.9531
+V2S Softmax Seen Acc:23.80, Unseen Acc:13.78, H Acc:17.46
+GZSL Classifier Seen Acc: 53.85%, Unseen Acc: 28.82%, H Acc: 37.54%
+GZSL Ensemble Seen Acc: 51.48%, Unseen Acc: 19.23%, H Acc: 28.00%
+EP[79/150]*******************************************************************
+G_cost: 4.3384, D2_loss: 2.5884, vae_loss: 3593.9917, loss: 3600.9185
+V2S Softmax Seen Acc:24.01, Unseen Acc:13.58, H Acc:17.35
+GZSL Classifier Seen Acc: 57.46%, Unseen Acc: 26.70%, H Acc: 36.46%
+GZSL Ensemble Seen Acc: 51.08%, Unseen Acc: 18.61%, H Acc: 27.28%
+EP[80/150]*******************************************************************
+G_cost: 4.7073, D2_loss: 2.5900, vae_loss: 3698.8750, loss: 3706.1721
+V2S Softmax Seen Acc:23.94, Unseen Acc:14.04, H Acc:17.70
+GZSL Classifier Seen Acc: 52.40%, Unseen Acc: 29.25%, H Acc: 37.54%
+GZSL Ensemble Seen Acc: 54.34%, Unseen Acc: 19.00%, H Acc: 28.15%
+EP[81/150]*******************************************************************
+G_cost: 5.1555, D2_loss: 2.6841, vae_loss: 3730.1963, loss: 3738.0359
+V2S Softmax Seen Acc:23.61, Unseen Acc:14.16, H Acc:17.70
+GZSL Classifier Seen Acc: 51.61%, Unseen Acc: 27.65%, H Acc: 36.01%
+GZSL Ensemble Seen Acc: 53.04%, Unseen Acc: 19.22%, H Acc: 28.22%
+EP[82/150]*******************************************************************
+G_cost: 5.0965, D2_loss: 2.7225, vae_loss: 3684.5444, loss: 3692.3633
+V2S Softmax Seen Acc:23.87, Unseen Acc:14.95, H Acc:18.38
+GZSL Classifier Seen Acc: 51.57%, Unseen Acc: 29.24%, H Acc: 37.32%
+GZSL Ensemble Seen Acc: 53.29%, Unseen Acc: 19.83%, H Acc: 28.90%
+EP[83/150]*******************************************************************
+G_cost: 6.0451, D2_loss: 2.7842, vae_loss: 3709.7734, loss: 3718.6028
+V2S Softmax Seen Acc:23.81, Unseen Acc:15.35, H Acc:18.67
+GZSL Classifier Seen Acc: 52.91%, Unseen Acc: 28.40%, H Acc: 36.96%
+GZSL Ensemble Seen Acc: 52.63%, Unseen Acc: 19.88%, H Acc: 28.85%
+EP[84/150]*******************************************************************
+G_cost: 7.0070, D2_loss: 3.0020, vae_loss: 3658.5984, loss: 3668.6074
+V2S Softmax Seen Acc:23.21, Unseen Acc:13.78, H Acc:17.29
+GZSL Classifier Seen Acc: 51.14%, Unseen Acc: 28.25%, H Acc: 36.40%
+GZSL Ensemble Seen Acc: 54.09%, Unseen Acc: 18.86%, H Acc: 27.97%
+EP[85/150]*******************************************************************
+G_cost: 5.3535, D2_loss: 2.7518, vae_loss: 3634.0750, loss: 3642.1802
+V2S Softmax Seen Acc:23.31, Unseen Acc:14.46, H Acc:17.85
+GZSL Classifier Seen Acc: 52.89%, Unseen Acc: 28.82%, H Acc: 37.31%
+GZSL Ensemble Seen Acc: 55.41%, Unseen Acc: 19.69%, H Acc: 29.05%
+EP[86/150]*******************************************************************
+G_cost: 4.5907, D2_loss: 2.8756, vae_loss: 3618.7725, loss: 3626.2390
+V2S Softmax Seen Acc:21.74, Unseen Acc:15.19, H Acc:17.88
+GZSL Classifier Seen Acc: 52.01%, Unseen Acc: 28.93%, H Acc: 37.18%
+GZSL Ensemble Seen Acc: 51.70%, Unseen Acc: 20.44%, H Acc: 29.29%
+EP[87/150]*******************************************************************
+G_cost: 6.7259, D2_loss: 2.7887, vae_loss: 3667.2764, loss: 3676.7910
+V2S Softmax Seen Acc:22.71, Unseen Acc:14.46, H Acc:17.67
+GZSL Classifier Seen Acc: 52.63%, Unseen Acc: 27.33%, H Acc: 35.98%
+GZSL Ensemble Seen Acc: 54.14%, Unseen Acc: 18.61%, H Acc: 27.70%
+EP[88/150]*******************************************************************
+G_cost: 7.2329, D2_loss: 2.7328, vae_loss: 3665.8389, loss: 3675.8047
+V2S Softmax Seen Acc:22.67, Unseen Acc:13.97, H Acc:17.29
+GZSL Classifier Seen Acc: 52.76%, Unseen Acc: 27.76%, H Acc: 36.38%
+GZSL Ensemble Seen Acc: 51.01%, Unseen Acc: 19.24%, H Acc: 27.94%
+EP[89/150]*******************************************************************
+G_cost: 7.1156, D2_loss: 2.8183, vae_loss: 3787.6890, loss: 3797.6228
+V2S Softmax Seen Acc:21.64, Unseen Acc:15.09, H Acc:17.78
+GZSL Classifier Seen Acc: 52.82%, Unseen Acc: 29.31%, H Acc: 37.70%
+GZSL Ensemble Seen Acc: 53.60%, Unseen Acc: 19.88%, H Acc: 29.00%
+EP[90/150]*******************************************************************
+G_cost: 5.7074, D2_loss: 2.8492, vae_loss: 3649.1489, loss: 3657.7056
+V2S Softmax Seen Acc:22.59, Unseen Acc:14.90, H Acc:17.95
+GZSL Classifier Seen Acc: 51.73%, Unseen Acc: 28.61%, H Acc: 36.84%
+GZSL Ensemble Seen Acc: 52.54%, Unseen Acc: 20.04%, H Acc: 29.02%
+EP[91/150]*******************************************************************
+G_cost: 5.8883, D2_loss: 2.7851, vae_loss: 3641.9644, loss: 3650.6377
+V2S Softmax Seen Acc:21.54, Unseen Acc:14.64, H Acc:17.43
+GZSL Classifier Seen Acc: 51.53%, Unseen Acc: 27.85%, H Acc: 36.16%
+GZSL Ensemble Seen Acc: 56.40%, Unseen Acc: 19.46%, H Acc: 28.93%
+EP[92/150]*******************************************************************
+G_cost: 5.5690, D2_loss: 2.7640, vae_loss: 3744.0859, loss: 3752.4189
+V2S Softmax Seen Acc:21.65, Unseen Acc:13.85, H Acc:16.89
+GZSL Classifier Seen Acc: 51.39%, Unseen Acc: 28.15%, H Acc: 36.38%
+GZSL Ensemble Seen Acc: 51.91%, Unseen Acc: 18.90%, H Acc: 27.71%
+EP[93/150]*******************************************************************
+G_cost: 5.6564, D2_loss: 2.7251, vae_loss: 3706.8425, loss: 3715.2241
+V2S Softmax Seen Acc:21.36, Unseen Acc:13.57, H Acc:16.59
+GZSL Classifier Seen Acc: 51.91%, Unseen Acc: 28.16%, H Acc: 36.51%
+GZSL Ensemble Seen Acc: 54.02%, Unseen Acc: 18.76%, H Acc: 27.85%
+EP[94/150]*******************************************************************
+G_cost: 7.4239, D2_loss: 2.7408, vae_loss: 3658.6660, loss: 3668.8306
+V2S Softmax Seen Acc:22.03, Unseen Acc:14.19, H Acc:17.26
+GZSL Classifier Seen Acc: 53.07%, Unseen Acc: 28.82%, H Acc: 37.36%
+GZSL Ensemble Seen Acc: 55.76%, Unseen Acc: 18.99%, H Acc: 28.33%
+EP[95/150]*******************************************************************
+G_cost: 6.5636, D2_loss: 2.6734, vae_loss: 3736.3955, loss: 3745.6326
+V2S Softmax Seen Acc:21.08, Unseen Acc:14.87, H Acc:17.44
+GZSL Classifier Seen Acc: 50.54%, Unseen Acc: 28.87%, H Acc: 36.75%
+GZSL Ensemble Seen Acc: 53.51%, Unseen Acc: 20.08%, H Acc: 29.20%
+EP[96/150]*******************************************************************
+G_cost: 6.5741, D2_loss: 2.5275, vae_loss: 3652.0713, loss: 3661.1729
+V2S Softmax Seen Acc:21.15, Unseen Acc:14.67, H Acc:17.32
+GZSL Classifier Seen Acc: 57.71%, Unseen Acc: 25.95%, H Acc: 35.80%
+GZSL Ensemble Seen Acc: 53.53%, Unseen Acc: 19.62%, H Acc: 28.72%
+EP[97/150]*******************************************************************
+G_cost: 7.8082, D2_loss: 2.5631, vae_loss: 3778.2739, loss: 3788.6450
+V2S Softmax Seen Acc:20.93, Unseen Acc:14.12, H Acc:16.86
+GZSL Classifier Seen Acc: 51.80%, Unseen Acc: 28.95%, H Acc: 37.15%
+GZSL Ensemble Seen Acc: 54.16%, Unseen Acc: 19.01%, H Acc: 28.15%
+EP[98/150]*******************************************************************
+G_cost: 5.9597, D2_loss: 2.4665, vae_loss: 3677.2017, loss: 3685.6279
+V2S Softmax Seen Acc:20.82, Unseen Acc:14.54, H Acc:17.12
+GZSL Classifier Seen Acc: 51.03%, Unseen Acc: 30.34%, H Acc: 38.05%
+GZSL Ensemble Seen Acc: 54.50%, Unseen Acc: 20.00%, H Acc: 29.27%
+EP[99/150]*******************************************************************
+G_cost: 8.1466, D2_loss: 2.5804, vae_loss: 3676.2295, loss: 3686.9565
+V2S Softmax Seen Acc:21.67, Unseen Acc:14.12, H Acc:17.10
+GZSL Classifier Seen Acc: 53.71%, Unseen Acc: 28.53%, H Acc: 37.26%
+GZSL Ensemble Seen Acc: 53.17%, Unseen Acc: 19.63%, H Acc: 28.68%
+EP[100/150]*******************************************************************
+G_cost: 8.2311, D2_loss: 2.4790, vae_loss: 3728.6147, loss: 3739.3250
+V2S Softmax Seen Acc:20.95, Unseen Acc:13.71, H Acc:16.57
+GZSL Classifier Seen Acc: 58.56%, Unseen Acc: 26.79%, H Acc: 36.76%
+GZSL Ensemble Seen Acc: 56.41%, Unseen Acc: 19.60%, H Acc: 29.09%
+EP[101/150]*******************************************************************
+G_cost: 7.0951, D2_loss: 2.4031, vae_loss: 3689.9714, loss: 3699.4697
+V2S Softmax Seen Acc:21.33, Unseen Acc:14.61, H Acc:17.34
+GZSL Classifier Seen Acc: 50.68%, Unseen Acc: 28.05%, H Acc: 36.11%
+GZSL Ensemble Seen Acc: 53.23%, Unseen Acc: 19.59%, H Acc: 28.64%
+EP[102/150]*******************************************************************
+G_cost: 8.7884, D2_loss: 2.4330, vae_loss: 3631.8225, loss: 3643.0437
+V2S Softmax Seen Acc:18.73, Unseen Acc:14.64, H Acc:16.43
+GZSL Classifier Seen Acc: 51.54%, Unseen Acc: 29.58%, H Acc: 37.59%
+GZSL Ensemble Seen Acc: 53.20%, Unseen Acc: 19.93%, H Acc: 28.99%
+EP[103/150]*******************************************************************
+G_cost: 9.1413, D2_loss: 2.4104, vae_loss: 3671.8062, loss: 3683.3579
+V2S Softmax Seen Acc:20.61, Unseen Acc:14.19, H Acc:16.81
+GZSL Classifier Seen Acc: 52.75%, Unseen Acc: 27.73%, H Acc: 36.36%
+GZSL Ensemble Seen Acc: 54.74%, Unseen Acc: 20.13%, H Acc: 29.43%
+EP[104/150]*******************************************************************
+G_cost: 7.9435, D2_loss: 2.4186, vae_loss: 3711.4961, loss: 3721.8584
+V2S Softmax Seen Acc:19.76, Unseen Acc:14.57, H Acc:16.77
+GZSL Classifier Seen Acc: 51.60%, Unseen Acc: 28.02%, H Acc: 36.32%
+GZSL Ensemble Seen Acc: 50.64%, Unseen Acc: 20.11%, H Acc: 28.79%
+EP[105/150]*******************************************************************
+G_cost: 7.2734, D2_loss: 2.4817, vae_loss: 3723.5493, loss: 3733.3044
+V2S Softmax Seen Acc:19.42, Unseen Acc:15.43, H Acc:17.20
+GZSL Classifier Seen Acc: 53.55%, Unseen Acc: 28.24%, H Acc: 36.98%
+GZSL Ensemble Seen Acc: 56.14%, Unseen Acc: 20.07%, H Acc: 29.57%
+EP[106/150]*******************************************************************
+G_cost: 8.3741, D2_loss: 2.3765, vae_loss: 3747.9580, loss: 3758.7085
+V2S Softmax Seen Acc:20.00, Unseen Acc:14.80, H Acc:17.01
+GZSL Classifier Seen Acc: 52.51%, Unseen Acc: 29.63%, H Acc: 37.88%
+GZSL Ensemble Seen Acc: 58.73%, Unseen Acc: 19.79%, H Acc: 29.61%
+EP[107/150]*******************************************************************
+G_cost: 8.5523, D2_loss: 2.2807, vae_loss: 3744.4292, loss: 3755.2622
+V2S Softmax Seen Acc:20.58, Unseen Acc:15.38, H Acc:17.61
+GZSL Classifier Seen Acc: 54.34%, Unseen Acc: 29.89%, H Acc: 38.56%
+GZSL Ensemble Seen Acc: 54.06%, Unseen Acc: 20.27%, H Acc: 29.49%
+EP[108/150]*******************************************************************
+G_cost: 8.7168, D2_loss: 2.1957, vae_loss: 3624.3525, loss: 3635.2651
+V2S Softmax Seen Acc:18.60, Unseen Acc:14.42, H Acc:16.24
+GZSL Classifier Seen Acc: 52.87%, Unseen Acc: 28.99%, H Acc: 37.45%
+GZSL Ensemble Seen Acc: 51.70%, Unseen Acc: 20.49%, H Acc: 29.35%
+EP[109/150]*******************************************************************
+G_cost: 8.9723, D2_loss: 2.3146, vae_loss: 3661.6841, loss: 3672.9712
+V2S Softmax Seen Acc:20.78, Unseen Acc:13.93, H Acc:16.68
+GZSL Classifier Seen Acc: 51.69%, Unseen Acc: 30.04%, H Acc: 38.00%
+GZSL Ensemble Seen Acc: 52.09%, Unseen Acc: 20.55%, H Acc: 29.47%
+EP[110/150]*******************************************************************
+G_cost: 9.2572, D2_loss: 2.2834, vae_loss: 3646.1665, loss: 3657.7070
+V2S Softmax Seen Acc:20.79, Unseen Acc:14.58, H Acc:17.14
+GZSL Classifier Seen Acc: 53.44%, Unseen Acc: 29.44%, H Acc: 37.97%
+GZSL Ensemble Seen Acc: 51.15%, Unseen Acc: 21.29%, H Acc: 30.06%
+EP[111/150]*******************************************************************
+G_cost: 9.2004, D2_loss: 2.1365, vae_loss: 3571.1636, loss: 3582.5005
+V2S Softmax Seen Acc:21.02, Unseen Acc:14.48, H Acc:17.14
+GZSL Classifier Seen Acc: 52.91%, Unseen Acc: 28.96%, H Acc: 37.44%
+GZSL Ensemble Seen Acc: 56.89%, Unseen Acc: 18.89%, H Acc: 28.36%
+EP[112/150]*******************************************************************
+G_cost: 9.1504, D2_loss: 2.1338, vae_loss: 3641.2910, loss: 3652.5752
+V2S Softmax Seen Acc:19.16, Unseen Acc:15.12, H Acc:16.90
+GZSL Classifier Seen Acc: 51.76%, Unseen Acc: 28.61%, H Acc: 36.85%
+GZSL Ensemble Seen Acc: 54.82%, Unseen Acc: 19.66%, H Acc: 28.94%
+EP[113/150]*******************************************************************
+G_cost: 10.1796, D2_loss: 2.0084, vae_loss: 3647.4438, loss: 3659.6321
+V2S Softmax Seen Acc:19.73, Unseen Acc:14.87, H Acc:16.96
+GZSL Classifier Seen Acc: 51.94%, Unseen Acc: 30.09%, H Acc: 38.10%
+GZSL Ensemble Seen Acc: 61.05%, Unseen Acc: 19.78%, H Acc: 29.88%
+EP[114/150]*******************************************************************
+G_cost: 9.0391, D2_loss: 2.0545, vae_loss: 3709.3975, loss: 3720.4910
+V2S Softmax Seen Acc:19.43, Unseen Acc:14.93, H Acc:16.89
+GZSL Classifier Seen Acc: 50.90%, Unseen Acc: 30.11%, H Acc: 37.83%
+GZSL Ensemble Seen Acc: 54.29%, Unseen Acc: 21.18%, H Acc: 30.48%
+EP[115/150]*******************************************************************
+G_cost: 9.3649, D2_loss: 2.1959, vae_loss: 3701.2891, loss: 3712.8499
+V2S Softmax Seen Acc:19.50, Unseen Acc:15.20, H Acc:17.08
+GZSL Classifier Seen Acc: 52.43%, Unseen Acc: 28.46%, H Acc: 36.89%
+GZSL Ensemble Seen Acc: 58.62%, Unseen Acc: 20.29%, H Acc: 30.14%
+EP[116/150]*******************************************************************
+G_cost: 9.1490, D2_loss: 2.0363, vae_loss: 3694.5747, loss: 3705.7600
+V2S Softmax Seen Acc:18.16, Unseen Acc:15.42, H Acc:16.68
+GZSL Classifier Seen Acc: 52.28%, Unseen Acc: 30.23%, H Acc: 38.31%
+GZSL Ensemble Seen Acc: 54.39%, Unseen Acc: 20.91%, H Acc: 30.21%
+EP[117/150]*******************************************************************
+G_cost: 9.3831, D2_loss: 2.0701, vae_loss: 3724.0142, loss: 3735.4673
+V2S Softmax Seen Acc:19.72, Unseen Acc:14.87, H Acc:16.95
+GZSL Classifier Seen Acc: 58.34%, Unseen Acc: 27.34%, H Acc: 37.23%
+GZSL Ensemble Seen Acc: 52.40%, Unseen Acc: 21.34%, H Acc: 30.33%
+EP[118/150]*******************************************************************
+G_cost: 9.0579, D2_loss: 2.0179, vae_loss: 3566.2151, loss: 3577.2908
+V2S Softmax Seen Acc:19.63, Unseen Acc:14.40, H Acc:16.61
+GZSL Classifier Seen Acc: 53.63%, Unseen Acc: 27.95%, H Acc: 36.75%
+GZSL Ensemble Seen Acc: 56.73%, Unseen Acc: 20.29%, H Acc: 29.89%
+EP[119/150]*******************************************************************
+G_cost: 10.6365, D2_loss: 2.0158, vae_loss: 3633.7397, loss: 3646.3921
+V2S Softmax Seen Acc:18.71, Unseen Acc:15.00, H Acc:16.65
+GZSL Classifier Seen Acc: 51.51%, Unseen Acc: 29.40%, H Acc: 37.43%
+GZSL Ensemble Seen Acc: 56.02%, Unseen Acc: 20.82%, H Acc: 30.36%
+EP[120/150]*******************************************************************
+G_cost: 10.3122, D2_loss: 2.0682, vae_loss: 3666.8818, loss: 3679.2622
+V2S Softmax Seen Acc:18.86, Unseen Acc:15.37, H Acc:16.94
+GZSL Classifier Seen Acc: 52.55%, Unseen Acc: 29.14%, H Acc: 37.49%
+GZSL Ensemble Seen Acc: 54.57%, Unseen Acc: 21.30%, H Acc: 30.64%
+EP[121/150]*******************************************************************
+G_cost: 9.8011, D2_loss: 2.1607, vae_loss: 3671.7371, loss: 3683.6987
+V2S Softmax Seen Acc:18.61, Unseen Acc:14.82, H Acc:16.50
+GZSL Classifier Seen Acc: 51.94%, Unseen Acc: 29.45%, H Acc: 37.58%
+GZSL Ensemble Seen Acc: 52.99%, Unseen Acc: 20.80%, H Acc: 29.87%
+EP[122/150]*******************************************************************
+G_cost: 8.3935, D2_loss: 2.1123, vae_loss: 3665.5962, loss: 3676.1021
+V2S Softmax Seen Acc:18.40, Unseen Acc:15.71, H Acc:16.95
+GZSL Classifier Seen Acc: 52.82%, Unseen Acc: 28.67%, H Acc: 37.17%
+GZSL Ensemble Seen Acc: 56.45%, Unseen Acc: 20.96%, H Acc: 30.57%
+EP[123/150]*******************************************************************
+G_cost: 9.1967, D2_loss: 2.2254, vae_loss: 3646.2468, loss: 3657.6689
+V2S Softmax Seen Acc:18.62, Unseen Acc:14.08, H Acc:16.04
+GZSL Classifier Seen Acc: 58.39%, Unseen Acc: 27.47%, H Acc: 37.36%
+GZSL Ensemble Seen Acc: 52.01%, Unseen Acc: 20.44%, H Acc: 29.35%
+EP[124/150]*******************************************************************
+G_cost: 9.1898, D2_loss: 2.2955, vae_loss: 3662.3162, loss: 3673.8015
+V2S Softmax Seen Acc:19.56, Unseen Acc:14.59, H Acc:16.72
+GZSL Classifier Seen Acc: 51.96%, Unseen Acc: 28.21%, H Acc: 36.56%
+GZSL Ensemble Seen Acc: 55.18%, Unseen Acc: 19.84%, H Acc: 29.19%
+EP[125/150]*******************************************************************
+G_cost: 10.3106, D2_loss: 2.3516, vae_loss: 3674.9971, loss: 3687.6592
+V2S Softmax Seen Acc:19.03, Unseen Acc:15.43, H Acc:17.04
+GZSL Classifier Seen Acc: 51.58%, Unseen Acc: 29.92%, H Acc: 37.87%
+GZSL Ensemble Seen Acc: 55.45%, Unseen Acc: 20.78%, H Acc: 30.23%
+EP[126/150]*******************************************************************
+G_cost: 8.9477, D2_loss: 2.3936, vae_loss: 3702.3276, loss: 3713.6689
+V2S Softmax Seen Acc:19.02, Unseen Acc:14.54, H Acc:16.48
+GZSL Classifier Seen Acc: 52.01%, Unseen Acc: 29.05%, H Acc: 37.28%
+GZSL Ensemble Seen Acc: 55.72%, Unseen Acc: 20.64%, H Acc: 30.12%
+EP[127/150]*******************************************************************
+G_cost: 10.3625, D2_loss: 2.4165, vae_loss: 3665.4043, loss: 3678.1833
+V2S Softmax Seen Acc:18.18, Unseen Acc:15.15, H Acc:16.53
+GZSL Classifier Seen Acc: 52.84%, Unseen Acc: 29.24%, H Acc: 37.65%
+GZSL Ensemble Seen Acc: 55.59%, Unseen Acc: 20.40%, H Acc: 29.84%
+EP[128/150]*******************************************************************
+G_cost: 9.4644, D2_loss: 2.4964, vae_loss: 3611.4097, loss: 3623.3704
+V2S Softmax Seen Acc:18.72, Unseen Acc:14.45, H Acc:16.31
+GZSL Classifier Seen Acc: 51.47%, Unseen Acc: 29.58%, H Acc: 37.57%
+GZSL Ensemble Seen Acc: 52.55%, Unseen Acc: 20.41%, H Acc: 29.40%
+EP[129/150]*******************************************************************
+G_cost: 8.8011, D2_loss: 2.6470, vae_loss: 3637.3267, loss: 3648.7747
+V2S Softmax Seen Acc:18.02, Unseen Acc:15.20, H Acc:16.49
+GZSL Classifier Seen Acc: 51.29%, Unseen Acc: 30.37%, H Acc: 38.15%
+GZSL Ensemble Seen Acc: 53.17%, Unseen Acc: 21.47%, H Acc: 30.59%
+EP[130/150]*******************************************************************
+G_cost: 10.9889, D2_loss: 2.5952, vae_loss: 3543.4116, loss: 3556.9958
+V2S Softmax Seen Acc:18.27, Unseen Acc:15.40, H Acc:16.71
+GZSL Classifier Seen Acc: 52.62%, Unseen Acc: 29.69%, H Acc: 37.96%
+GZSL Ensemble Seen Acc: 52.39%, Unseen Acc: 20.96%, H Acc: 29.94%
+EP[131/150]*******************************************************************
+G_cost: 9.2607, D2_loss: 2.8048, vae_loss: 3660.2751, loss: 3672.3408
+V2S Softmax Seen Acc:18.06, Unseen Acc:15.09, H Acc:16.44
+GZSL Classifier Seen Acc: 51.72%, Unseen Acc: 30.63%, H Acc: 38.48%
+GZSL Ensemble Seen Acc: 52.32%, Unseen Acc: 21.28%, H Acc: 30.26%
+EP[132/150]*******************************************************************
+G_cost: 9.2441, D2_loss: 2.8245, vae_loss: 3637.3511, loss: 3649.4197
+V2S Softmax Seen Acc:18.48, Unseen Acc:15.15, H Acc:16.65
+GZSL Classifier Seen Acc: 51.23%, Unseen Acc: 30.56%, H Acc: 38.28%
+GZSL Ensemble Seen Acc: 51.13%, Unseen Acc: 20.81%, H Acc: 29.58%
+EP[133/150]*******************************************************************
+G_cost: 7.9790, D2_loss: 2.7897, vae_loss: 3706.9321, loss: 3717.7009
+V2S Softmax Seen Acc:17.84, Unseen Acc:14.89, H Acc:16.23
+GZSL Classifier Seen Acc: 52.20%, Unseen Acc: 30.97%, H Acc: 38.87%
+GZSL Ensemble Seen Acc: 59.01%, Unseen Acc: 19.98%, H Acc: 29.86%
+EP[134/150]*******************************************************************
+G_cost: 8.1077, D2_loss: 2.8162, vae_loss: 3697.8455, loss: 3708.7693
+V2S Softmax Seen Acc:18.62, Unseen Acc:15.16, H Acc:16.71
+GZSL Classifier Seen Acc: 51.97%, Unseen Acc: 28.88%, H Acc: 37.12%
+GZSL Ensemble Seen Acc: 57.38%, Unseen Acc: 21.15%, H Acc: 30.91%
+EP[135/150]*******************************************************************
+G_cost: 9.9665, D2_loss: 2.8943, vae_loss: 3629.4209, loss: 3642.2817
+V2S Softmax Seen Acc:18.54, Unseen Acc:14.52, H Acc:16.29
+GZSL Classifier Seen Acc: 51.33%, Unseen Acc: 30.12%, H Acc: 37.97%
+GZSL Ensemble Seen Acc: 53.84%, Unseen Acc: 20.82%, H Acc: 30.03%
+EP[136/150]*******************************************************************
+G_cost: 9.8685, D2_loss: 3.0168, vae_loss: 3610.2642, loss: 3623.1494
+V2S Softmax Seen Acc:18.04, Unseen Acc:14.88, H Acc:16.31
+GZSL Classifier Seen Acc: 53.46%, Unseen Acc: 30.51%, H Acc: 38.85%
+GZSL Ensemble Seen Acc: 57.90%, Unseen Acc: 19.70%, H Acc: 29.39%
+EP[137/150]*******************************************************************
+G_cost: 8.2666, D2_loss: 3.0239, vae_loss: 3644.4355, loss: 3655.7261
+V2S Softmax Seen Acc:17.50, Unseen Acc:15.15, H Acc:16.24
+GZSL Classifier Seen Acc: 50.26%, Unseen Acc: 30.14%, H Acc: 37.68%
+GZSL Ensemble Seen Acc: 57.23%, Unseen Acc: 20.14%, H Acc: 29.80%
+EP[138/150]*******************************************************************
+G_cost: 9.2292, D2_loss: 3.0487, vae_loss: 3784.0229, loss: 3796.3008
+V2S Softmax Seen Acc:18.24, Unseen Acc:14.94, H Acc:16.43
+GZSL Classifier Seen Acc: 52.23%, Unseen Acc: 29.70%, H Acc: 37.87%
+GZSL Ensemble Seen Acc: 57.72%, Unseen Acc: 20.32%, H Acc: 30.06%
+EP[139/150]*******************************************************************
+G_cost: 9.0743, D2_loss: 2.9979, vae_loss: 3639.2905, loss: 3651.3625
+V2S Softmax Seen Acc:18.89, Unseen Acc:14.41, H Acc:16.35
+GZSL Classifier Seen Acc: 51.05%, Unseen Acc: 30.24%, H Acc: 37.98%
+GZSL Ensemble Seen Acc: 56.47%, Unseen Acc: 20.81%, H Acc: 30.42%
+EP[140/150]*******************************************************************
+G_cost: 8.6680, D2_loss: 3.3214, vae_loss: 3598.8496, loss: 3610.8389
+V2S Softmax Seen Acc:17.46, Unseen Acc:14.48, H Acc:15.83
+GZSL Classifier Seen Acc: 51.69%, Unseen Acc: 30.85%, H Acc: 38.64%
+GZSL Ensemble Seen Acc: 56.96%, Unseen Acc: 20.84%, H Acc: 30.51%
+EP[141/150]*******************************************************************
+G_cost: 8.9238, D2_loss: 3.2867, vae_loss: 3644.5710, loss: 3656.7815
+V2S Softmax Seen Acc:17.49, Unseen Acc:15.48, H Acc:16.42
+GZSL Classifier Seen Acc: 50.85%, Unseen Acc: 31.11%, H Acc: 38.61%
+GZSL Ensemble Seen Acc: 55.87%, Unseen Acc: 20.68%, H Acc: 30.19%
+EP[142/150]*******************************************************************
+G_cost: 9.1132, D2_loss: 3.4715, vae_loss: 3717.5298, loss: 3730.1145
+V2S Softmax Seen Acc:18.27, Unseen Acc:15.13, H Acc:16.55
+GZSL Classifier Seen Acc: 50.42%, Unseen Acc: 30.39%, H Acc: 37.93%
+GZSL Ensemble Seen Acc: 53.12%, Unseen Acc: 21.40%, H Acc: 30.51%
+EP[143/150]*******************************************************************
+G_cost: 9.6910, D2_loss: 3.2890, vae_loss: 3616.0764, loss: 3629.0564
+V2S Softmax Seen Acc:19.56, Unseen Acc:15.62, H Acc:17.37
+GZSL Classifier Seen Acc: 58.25%, Unseen Acc: 27.51%, H Acc: 37.37%
+GZSL Ensemble Seen Acc: 57.75%, Unseen Acc: 20.68%, H Acc: 30.45%
+EP[144/150]*******************************************************************
+G_cost: 9.3704, D2_loss: 3.2931, vae_loss: 3727.7720, loss: 3740.4355
+V2S Softmax Seen Acc:18.38, Unseen Acc:15.08, H Acc:16.57
+GZSL Classifier Seen Acc: 51.38%, Unseen Acc: 30.94%, H Acc: 38.62%
+GZSL Ensemble Seen Acc: 55.12%, Unseen Acc: 20.99%, H Acc: 30.40%
+EP[145/150]*******************************************************************
+G_cost: 8.7833, D2_loss: 3.5815, vae_loss: 3724.7427, loss: 3737.1074
+V2S Softmax Seen Acc:18.15, Unseen Acc:15.00, H Acc:16.42
+GZSL Classifier Seen Acc: 50.44%, Unseen Acc: 30.81%, H Acc: 38.26%
+GZSL Ensemble Seen Acc: 56.32%, Unseen Acc: 20.53%, H Acc: 30.09%
+EP[146/150]*******************************************************************
+G_cost: 7.9897, D2_loss: 3.4851, vae_loss: 3703.5820, loss: 3715.0569
+V2S Softmax Seen Acc:18.42, Unseen Acc:15.15, H Acc:16.62
+GZSL Classifier Seen Acc: 51.55%, Unseen Acc: 31.83%, H Acc: 39.36%
+GZSL Ensemble Seen Acc: 59.27%, Unseen Acc: 20.73%, H Acc: 30.71%
+EP[147/150]*******************************************************************
+G_cost: 8.9219, D2_loss: 3.5294, vae_loss: 3678.5444, loss: 3690.9958
+V2S Softmax Seen Acc:19.20, Unseen Acc:14.39, H Acc:16.45
+GZSL Classifier Seen Acc: 52.22%, Unseen Acc: 30.19%, H Acc: 38.26%
+GZSL Ensemble Seen Acc: 59.30%, Unseen Acc: 20.07%, H Acc: 29.98%
+EP[148/150]*******************************************************************
+G_cost: 8.7971, D2_loss: 3.7192, vae_loss: 3697.7302, loss: 3710.2466
+V2S Softmax Seen Acc:17.78, Unseen Acc:15.25, H Acc:16.42
+GZSL Classifier Seen Acc: 57.18%, Unseen Acc: 29.30%, H Acc: 38.75%
+GZSL Ensemble Seen Acc: 54.69%, Unseen Acc: 20.88%, H Acc: 30.22%
+EP[149/150]*******************************************************************
+G_cost: 7.2362, D2_loss: 3.6164, vae_loss: 3704.4395, loss: 3715.2922
+V2S Softmax Seen Acc:17.43, Unseen Acc:15.56, H Acc:16.44
+GZSL Classifier Seen Acc: 50.67%, Unseen Acc: 30.97%, H Acc: 38.44%
+GZSL Ensemble Seen Acc: 56.25%, Unseen Acc: 20.50%, H Acc: 30.05%
+
